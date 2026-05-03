@@ -14,6 +14,18 @@ app.get("/", (req, res) =>
   res.json({ status:"ok", mode: API_KEY ? "live" : "paper" })
 );
 
+app.get("/markets", async (req, res) => {
+  try {
+    const r = await fetch(
+      "https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume&ascending=false&limit=200"
+    );
+    const data = await r.json();
+    res.json(data);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/order", async (req, res) => {
   const { market, tokenId, side, amount, price } = req.body;
   console.log(`[ORDER] ${side} ${market} $${amount} @${price}`);
