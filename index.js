@@ -1,0 +1,54 @@
+const express = require("express");
+const cors    = require("cors");
+const fetch   = require("node-fetch");
+const app     = express();
+
+app.use(cors());
+app.use(express.json());
+
+const API_KEY  = process.env.POLY_API_KEY  || "";
+const API_SEC  = process.env.POLY_API_SEC  || "";
+const API_PASS = process.env.POLY_API_PASS || "";
+
+app.get("/", (req, res) =>
+  res.json({ status:"ok", mode: API_KEY ? "live" : "paper" })
+);
+
+app.post("/order", async (req, res) => {
+  const { market, tokenId, side, amount, price } = req.body;
+  console.log(`[ORDER] ${side} ${market} $${amount} @${price}`);
+
+  if (!API_KEY) {
+    return res.json({
+      status: "paper",
+      msg: "Simulated — no API key",
+      order: req.body
+    });
+  }
+
+  try {
+    const r = await fetch("https://clob.polymarket.com/order", {
+      method: "POST",
+      headers: {
+        "Content-Type":    "application/json",
+        "POLY-API-KEY":    API_KEY,
+        "POLY-SECRET":     API_SEC,
+        "POLY-PASSPHRASE": API_PASS,
+      },
+      body: JSON.stringify({
+        order_type: "FOK",
+        token_id:   tokenId,
+        side, size: amount, price
+      }),
+    });
+    const data = await r.json();
+    res.json({ status:"live", data });
+  } catch(e) {
+    res.status(500).json({ status:"error", msg: e.message });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, ()=>
+  console.log(`POLYARB proxy running on :${PORT}`)
+);
