@@ -65,7 +65,7 @@ app.post("/order", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-// Keep-alive : ping toutes les 4 minutes
+// Keep-alive : ping every 4 minutes 
 setInterval(async () => {
   try {
     await fetch("https://polyarb-proxy-production.up.railway.app/");
