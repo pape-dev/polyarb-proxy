@@ -1,14 +1,16 @@
 const express = require("express");
-const cors    = require("cors");
 const fetch   = require("node-fetch");
 const app     = express();
 
-app.use(cors({
-  origin: "*",
-  methods: ["GET","POST"],
-  allowedHeaders: ["Content-Type"]
-}));
 app.use(express.json());
+
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
 
 const API_KEY  = process.env.POLY_API_KEY  || "";
 const API_SEC  = process.env.POLY_API_SEC  || "";
@@ -33,7 +35,6 @@ app.get("/markets", async (req, res) => {
 app.post("/order", async (req, res) => {
   const { market, tokenId, side, amount, price } = req.body;
   console.log(`[ORDER] ${side} ${market} $${amount} @${price}`);
-
   if (!API_KEY) {
     return res.json({
       status: "paper",
@@ -41,7 +42,6 @@ app.post("/order", async (req, res) => {
       order: req.body
     });
   }
-
   try {
     const r = await fetch("https://clob.polymarket.com/order", {
       method: "POST",
@@ -53,7 +53,7 @@ app.post("/order", async (req, res) => {
       },
       body: JSON.stringify({
         order_type: "FOK",
-        token_id:   tokenId,
+        token_id: tokenId,
         side, size: amount, price
       }),
     });
@@ -65,6 +65,6 @@ app.post("/order", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, ()=>
+app.listen(PORT, () =>
   console.log(`POLYARB proxy running on :${PORT}`)
 );
