@@ -70,6 +70,7 @@ setInterval(async () => {
     await fetch("https://polyarb-proxy-production.up.railway.app/");
     console.log("[PING] proxy actif");
   } catch(e) {}
-}, 240000);app.listen(PORT, () =>
+}, 240000);
+app.listen(PORT, () =>
   console.log(`POLYARB proxy running on :${PORT}`)
 );
