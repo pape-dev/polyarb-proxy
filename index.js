@@ -1,5 +1,6 @@
 const express = require("express");
 const fetch   = require("node-fetch");
+const path    = require("path");
 const app     = express();
 
 app.use(express.json());
@@ -16,8 +17,9 @@ const API_KEY  = process.env.POLY_API_KEY  || "";
 const API_SEC  = process.env.POLY_API_SEC  || "";
 const API_PASS = process.env.POLY_API_PASS || "";
 
+// Sert le bot HTML
 app.get("/", (req, res) =>
-  res.json({ status:"ok", mode: API_KEY ? "live" : "paper" })
+  res.sendFile(path.join(__dirname, "public", "index.html"))
 );
 
 app.get("/markets", async (req, res) => {
@@ -64,14 +66,15 @@ app.post("/order", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
-// Keep-alive : ping toutes les 4 minutes
+// Keep-alive
 setInterval(async () => {
   try {
     await fetch("https://polyarb-proxy-production.up.railway.app/");
     console.log("[PING] proxy actif");
   } catch(e) {}
 }, 240000);
+
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
   console.log(`POLYARB proxy running on :${PORT}`)
 );
