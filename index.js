@@ -65,6 +65,12 @@ app.post("/order", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
+// Keep-alive : ping toutes les 4 minutes
+setInterval(async () => {
+  try {
+    await fetch("https://polyarb-proxy-production.up.railway.app/");
+    console.log("[PING] proxy actif");
+  } catch(e) {}
+}, 240000);app.listen(PORT, () =>
   console.log(`POLYARB proxy running on :${PORT}`)
 );
