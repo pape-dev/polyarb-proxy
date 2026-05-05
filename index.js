@@ -31,23 +31,6 @@ const filtered = markets.filter(m => {
 });
 res.json(filtered);;
   } catch(e) { 
-    app.get('/cfg', async (req, res) => {
-  const r = await pool.query('SELECT key, value FROM cfg');
-  const cfg = {};
-  r.rows.forEach(row => cfg[row.key] = row.value);
-  res.json(cfg);
-});
-
-app.post('/cfg', async (req, res) => {
-  const entries = Object.entries(req.body);
-  for (const [key, value] of entries) {
-    await pool.query(
-      'INSERT INTO cfg (key,value) VALUES($1,$2) ON CONFLICT (key) DO UPDATE SET value=$2',
-      [key, String(value)]
-    );
-  }
-  res.json({ ok: true });
-});
     res.status(500).json({ error: e.message });
   }
 });
