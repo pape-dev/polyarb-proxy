@@ -612,7 +612,9 @@ function useStore() {
     // [3] BH correction sur toutes les paires, puis validation finale
     const updated = bhCorrect(rawUpdated).map(pair=>{
       const est = pair.bayesEst;
-      const validation = validateSignal(est, pair.pB, c);
+      // [v9] injecter isSports dans est pour mode rapide SPORTS
+      const estWS = est ? { ...est, isSports: pair.isSports ?? false } : null;
+      const validation = validateSignal(estWS, pair.pB, c);
       const edge = validation.valid ? validation.edge : 0;
       // [v8-4] repasse aiConf au kelly final
       const aiConf = pair.analysis?.confidence ?? null;
