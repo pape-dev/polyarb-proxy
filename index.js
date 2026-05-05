@@ -29,6 +29,23 @@ app.get("/markets", async (req, res) => {
 
 app.post("/order", async (req, res) => {
   const { market, tokenId, side, amount, price } = req.body;
+  app.get('/cfg', async (req, res) => {
+  const r = await pool.query('SELECT key, value FROM cfg');
+  const cfg = {};
+  r.rows.forEach(row => cfg[row.key] = row.value);
+  res.json(cfg);
+});
+
+app.post('/cfg', async (req, res) => {
+  const entries = Object.entries(req.body);
+  for (const [key, value] of entries) {
+    await pool.query(
+      'INSERT INTO cfg (key,value) VALUES($1,$2) ON CONFLICT (key) DO UPDATE SET value=$2',
+      [key, String(value)]
+    );
+  }
+  res.json({ ok: true });
+});
   console.log(`[ORDER] ${side} ${market} $${amount} @${price}`);
   const API_KEY = process.env.POLY_API_KEY || "";
   if (!API_KEY) return res.json({ status:"paper", msg:"Simulated", order:req.body });
