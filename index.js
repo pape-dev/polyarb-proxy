@@ -2,10 +2,7 @@ const express = require("express");
 const fetch   = require("node-fetch");
 const path    = require("path");
 const app     = express();
-const { Pool } = require('pg');
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
-pool.query(`CREATE TABLE IF NOT EXISTS cfg (key TEXT PRIMARY KEY, value TEXT)`);
 app.use(express.json());
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
@@ -22,15 +19,10 @@ app.get("/", (req, res) =>
 
 app.get("/markets", async (req, res) => {
   try {
-    const r = await fetch("https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume&ascending=false&limit=100");
+    const r = await fetch("https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume&ascending=false&limit=50");
     const data = await r.json();
-    const markets = Array.isArray(data) ? data : (data.results || []);
-const filtered = markets.filter(m => {
-  const p = parseFloat(m.price);
-  return p > 0.10 && p < 0.90;
-});
-res.json(filtered);;
-  } catch(e) { 
+    res.json(data);
+  } catch(e) {
     res.status(500).json({ error: e.message });
   }
 });
