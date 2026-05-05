@@ -2,6 +2,7 @@ const express = require("express");
 const fetch   = require("node-fetch");
 const path    = require("path");
 const app     = express();
+
 const { Pool } = require('pg');
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
