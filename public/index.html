@@ -135,7 +135,7 @@ async function batchMap(arr, fn, batchSize=4, delayMs=200) {
 
 // ─── API (inchangé v6) ────────────────────────────────────────
 async function discoverMarkets() {
-  const { signal, cancel } = mkAbort(7000);
+  const { signal, cancel } = mkAbort(15000); // [v11] timeout étendu
   try {
     const r = await fetch(`https://polyarb-proxy-production.up.railway.app/markets`, { signal });
     cancel();
