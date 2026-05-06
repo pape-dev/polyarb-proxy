@@ -419,6 +419,7 @@ function buildPairs(markets, prev=[], savedHist={}) {
   const VOL_MIN = 5000, LIQ_MIN = 1000;
   const groups = {};
   for (const m of markets) {
+if (parseFloat(m.price) < 0.10 || parseFloat(m.price) > 0.90) continue;   
     if (m.volume24h < VOL_MIN || m.liquidity < LIQ_MIN) continue;
     const txt = (m.title+" "+m.slug).toLowerCase();
     for (const seed of SEEDS) {
