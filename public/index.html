@@ -28,7 +28,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // ─── CONFIG ───────────────────────────────────────────────────
 const DEFAULT_CFG = {
   minEdge: 0.08, kellyFrac: 0.25, maxPct: 0.05,
-  maxDaily: 20, slipMax: 0.06,, cooldown: 45000,
+  maxDaily: 20, slipMax: 0.06, cooldown: 45000,
   histWindow: 40, minBayesPts: 12, refreshMs: 9000,
   proxyUrl: "https://polyarb-proxy-production.up.railway.app/order", bankroll: 2000,
   minDelta: 0.08,
@@ -49,7 +49,22 @@ const DEFAULT_CFG = {
 
 const GAMMA = "https://polyarb-proxy-production.up.railway.app";
 const CLOB  = "https://clob.polymarket.com";
-
+async function loadCfgFromDB(setCfg) {
+  try {
+    const r = await fetch('/cfg');
+    const saved = await r.json();
+    if (Object.keys(saved).length > 0) {
+      setCfg(prev => ({
+        ...prev,
+        autoExec: saved.autoExec ? Number(saved.autoExec) : prev.autoExec,
+        slipMax: saved.slipMax ? Number(saved.slipMax) : prev.slipMax,
+      }));
+      console.log('[CFG] Chargé depuis DB ✅');
+    }
+  } catch(e) {
+    console.log('[CFG] Pas de DB, CFG par défaut');
+  }
+}
 const SEEDS = [
   { id:"CRYPTO",   emoji:"₿",  kw:["bitcoin","ethereum","crypto","solana","btc","eth","binance","coinbase","defi"] },
   { id:"POLITICS", emoji:"🗳", kw:["trump","president","congress","election","senate","vote","democrat","republican","biden","harris","governor"] },
