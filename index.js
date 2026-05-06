@@ -38,12 +38,7 @@ app.get('/markets', async (req, res) => {
   try {
     const r = await fetch("https://gamma-api.polymarket.com/markets?limit=100&active=true");
     const data = await r.json();
-    const markets = Array.isArray(data) ? data : (data.results || []);
-    const filtered = markets.filter(m => {
-      const p = parseFloat(m.price);
-      return p > 0.10 && p < 0.90;
-    });
-    res.json(filtered);
+    res.json(data);
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
