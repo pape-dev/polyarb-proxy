@@ -35,7 +35,7 @@ app.get("/", (req, res) =>
 
 app.get("/markets", async (req, res) => {
   try {
-    const r = await fetch("https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume&ascending=false&limit=50");
+    const r = await fetch("https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume&ascending=false&limit=100");
     const data = await r.json();
     res.json(data);
   } catch(e) {
