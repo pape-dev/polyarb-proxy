@@ -488,6 +488,13 @@ function useStore() {
 useEffect(()=>{
   loadCfgFromDB(setCfg);
 }, []);
+  useEffect(()=>{
+  fetch('/cfg', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ autoExec: cfg.autoExec })
+  }).catch(()=>{});
+}, [cfg.autoExec]);
   const log = useCallback((kind,msg)=>{
     const ts = new Date().toISOString().slice(11,22);
     setLogs(l=>[...l.slice(-400),{ts,kind,msg,id:Date.now()+Math.random()}]);
