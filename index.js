@@ -86,7 +86,7 @@ app.post("/order", async (req, res) => {
 
 setInterval(async () => {
   try { await fetch("https://polyarb-proxy-production.up.railway.app/"); } catch(e) {}
-}, 240000);
+}, 120000);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`POLYARB proxy on :${PORT}`));
