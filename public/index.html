@@ -485,7 +485,9 @@ function useStore() {
   useEffect(()=>{ pairsRef.current = pairs;     },[pairs]);
   useEffect(()=>{ cfgRef.current   = cfg;       },[cfg]);
   useEffect(()=>{ posRef.current   = positions; },[positions]);
-
+useEffect(()=>{
+  loadCfgFromDB(setCfg);
+}, []);
   const log = useCallback((kind,msg)=>{
     const ts = new Date().toISOString().slice(11,22);
     setLogs(l=>[...l.slice(-400),{ts,kind,msg,id:Date.now()+Math.random()}]);
