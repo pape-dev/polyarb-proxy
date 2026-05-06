@@ -46,7 +46,7 @@ app.get('/markets', async (req, res) => {
       return res.json(filtered);
     } catch(e) {
       if (i === 2) return res.status(500).json({ error: e.message });
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(resolve => setTimeout(resolve, 2000));
     }
   }
 });
