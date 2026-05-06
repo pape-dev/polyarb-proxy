@@ -33,13 +33,21 @@ app.get("/", (req, res) =>
   res.sendFile(path.join(__dirname, "public", "index.html"))
 );
 
-app.get("/markets", async (req, res) => {
-  try {
-    const r = await fetch("https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume&ascending=false&limit=100");
-    const data = await r.json();
-    res.json(data);
-  } catch(e) {
-    res.status(500).json({ error: e.message });
+app.get('/markets', async (req, res) => {
+  for (let i = 0; i < 3; i++) {
+    try {
+      const r = await fetch("https://gamma-api.polymarket.com/markets?limit=100&active=true");
+      const data = await r.json();
+      const markets = Array.isArray(data) ? data : (data.results || []);
+      const filtered = markets.filter(m => {
+        const p = parseFloat(m.price);
+        return p > 0.10 && p < 0.90;
+      });
+      return res.json(filtered);
+    } catch(e) {
+      if (i === 2) return res.status(500).json({ error: e.message });
+      await new Promise(r => setTimeout(r, 2000));
+    }
   }
 });
 app.get('/cfg', async (req, res) => {
