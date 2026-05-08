@@ -420,7 +420,7 @@ function makePair(idStr, cat, catLabel, mA, mB, prev, savedHist={}, isSports=fal
 }
 
 function buildPairs(markets, prev=[], savedHist={}) {
-  const VOL_MIN = 5000, LIQ_MIN = 1000;
+  const VOL_MIN = 100, LIQ_MIN = 50;
   const groups = {};
   for (const m of markets) {
     const price = parseFloat(m.price);
