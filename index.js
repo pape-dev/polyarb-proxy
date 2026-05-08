@@ -19,7 +19,6 @@ async function initDB() {
   }
 }
 initDB();
-app.use(express.json());
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -27,6 +26,7 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
+app.use(express.json());
 
 app.use(express.static(path.join(__dirname, "public")));
 app.get("/", (req, res) =>
@@ -44,21 +44,31 @@ app.get('/markets', async (req, res) => {
   }
 });
 app.get('/cfg', async (req, res) => {
-  const r = await pool.query('SELECT key, value FROM cfg');
-  const cfg = {};
-  r.rows.forEach(row => cfg[row.key] = row.value);
-  res.json(cfg);
+  try {
+    const r = await pool.query('SELECT key, value FROM cfg');
+    const cfg = {};
+    r.rows.forEach(row => cfg[row.key] = row.value);
+    res.json(cfg);
+  } catch(e) {
+    console.error('[CFG GET] Erreur:', e.message);
+    res.json({});
+  }
 });
 
 app.post('/cfg', async (req, res) => {
-  const entries = Object.entries(req.body);
-  for (const [key, value] of entries) {
-    await pool.query(
-      'INSERT INTO cfg (key,value) VALUES($1,$2) ON CONFLICT (key) DO UPDATE SET value=$2',
-      [key, String(value)]
-    );
+  try {
+    const entries = Object.entries(req.body);
+    for (const [key, value] of entries) {
+      await pool.query(
+        'INSERT INTO cfg (key,value) VALUES($1,$2) ON CONFLICT (key) DO UPDATE SET value=$2',
+        [key, String(value)]
+      );
+    }
+    res.json({ ok: true });
+  } catch(e) {
+    console.error('[CFG POST] Erreur:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
   }
-  res.json({ ok: true });
 });
 app.post("/order", async (req, res) => {
   const { market, tokenId, side, amount, price } = req.body;
@@ -78,7 +88,7 @@ app.post("/order", async (req, res) => {
 });
 
 setInterval(async () => {
-  try { await fetch("https://polyarb-proxy-production.up.railway.app/"); } catch(e) {}
+  try { await fetch("https://polyarb-proxy-production.up.railway.app/markets"); } catch(e) {}
 }, 120000);
 
 const PORT = process.env.PORT || 3000;
