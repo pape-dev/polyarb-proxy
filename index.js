@@ -36,6 +36,37 @@ async function getClobClient() {
   }
 }
 
+// [v9-4] Helper de fetch externe robuste : Polymarket/Cloudflare bloque parfois les requêtes
+// sans User-Agent "normal" (le UA par défaut de node-fetch ressemble à un bot). On force un
+// UA de navigateur + timeout explicite, et on loggue le détail réel de l'échec côté serveur
+// (visible dans les logs Render) au lieu de laisser le frontend deviner avec un "bloquée" opaque.
+async function fetchExternal(url, opts = {}, timeoutMs = 12000) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, {
+      ...opts,
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "application/json",
+        ...(opts.headers || {}),
+      },
+    });
+    clearTimeout(t);
+    if (!r.ok) {
+      const body = await r.text().catch(() => "");
+      console.error(`[EXT] ${url} → HTTP ${r.status} — ${body.slice(0, 200)}`);
+      throw new Error(`HTTP ${r.status}`);
+    }
+    return r;
+  } catch (e) {
+    clearTimeout(t);
+    console.error(`[EXT] ${url} → ÉCHEC: ${e.message}`);
+    throw e;
+  }
+}
+
 async function initDB() {
   try {
     await pool.query(`CREATE TABLE IF NOT EXISTS cfg (key TEXT PRIMARY KEY, value TEXT)`);
@@ -64,11 +95,12 @@ app.get("/", (req, res) =>
 
 app.get('/markets', async (req, res) => {
   try {
-    const r = await fetch("https://gamma-api.polymarket.com/markets?limit=500&active=true&order=volume&ascending=false");
+    const r = await fetchExternal("https://gamma-api.polymarket.com/markets?limit=500&active=true&order=volume&ascending=false");
     const data = await r.json();
     res.json(data);
   } catch(e) {
-    res.status(500).json({ error: e.message });
+    // [v9-4] on renvoie le détail de l'échec pour diagnostic (visible en Network tab si besoin)
+    res.status(502).json({ error: e.message, hint: "Voir logs serveur Render pour le détail (préfixe [EXT])" });
   }
 });
 
@@ -78,8 +110,7 @@ app.get('/price', async (req, res) => {
   const { slug } = req.query;
   if (!slug) return res.status(400).json({ error: "slug requis" });
   try {
-    const r = await fetch(`https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(slug)}&limit=1`);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const r = await fetchExternal(`https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(slug)}&limit=1`);
     const raw = await r.json();
     const m = Array.isArray(raw) ? raw[0] : raw?.markets?.[0];
     if (!m) return res.json({ price: null, closed: false, found: false });
@@ -103,8 +134,7 @@ app.get('/book', async (req, res) => {
   const { tokenId } = req.query;
   if (!tokenId) return res.status(400).json({ error: "tokenId requis" });
   try {
-    const r = await fetch(`https://clob.polymarket.com/book?token_id=${encodeURIComponent(tokenId)}`);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const r = await fetchExternal(`https://clob.polymarket.com/book?token_id=${encodeURIComponent(tokenId)}`);
     const d = await r.json();
     res.json({
       simulated: false,
@@ -123,7 +153,7 @@ app.post('/ai', async (req, res) => {
   const { labelA, labelB, pA, pB, fair, fairCI, edge, est } = req.body;
   if (!est) return res.status(400).json({ error: "est requis" });
   try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
+    const r = await fetchExternal("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -158,8 +188,7 @@ app.get('/history', async (req, res) => {
   const { tokenId, interval = 'max', fidelity = '60' } = req.query;
   if (!tokenId) return res.status(400).json({ error: "tokenId requis", history: [] });
   try {
-    const r = await fetch(`https://clob.polymarket.com/prices-history?market=${encodeURIComponent(tokenId)}&interval=${encodeURIComponent(interval)}&fidelity=${encodeURIComponent(fidelity)}`);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const r = await fetchExternal(`https://clob.polymarket.com/prices-history?market=${encodeURIComponent(tokenId)}&interval=${encodeURIComponent(interval)}&fidelity=${encodeURIComponent(fidelity)}`);
     const d = await r.json();
     res.json(d);
   } catch(e) {
@@ -249,7 +278,7 @@ app.post("/order", async (req, res) => {
 });
 
 setInterval(async () => {
-  try { await fetch("https://polyarb-proxy-production.up.railway.app/markets"); } catch(e) {}
+  try { await fetch("https://polyarb-proxy.onrender.com/markets"); } catch(e) {}
 }, 120000);
 
 const PORT = process.env.PORT || 3000;
