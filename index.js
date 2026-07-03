@@ -94,8 +94,13 @@ app.get("/", (req, res) =>
 );
 
 app.get('/markets', async (req, res) => {
+  // [v9-6] tag_id optionnel : cible une catégorie (ex. Sports=100639) indépendamment
+  // du classement par volume global, où les marchés sportifs à volume plus modeste
+  // sont souvent exclus du top 500 toutes catégories confondues.
+  const { tag_id } = req.query;
+  const tagParam = tag_id ? `&tag_id=${encodeURIComponent(tag_id)}` : "";
   try {
-    const r = await fetchExternal("https://gamma-api.polymarket.com/markets?limit=500&active=true&order=volume&ascending=false");
+    const r = await fetchExternal(`https://gamma-api.polymarket.com/markets?limit=500&active=true&order=volume&ascending=false${tagParam}`);
     const data = await r.json();
     res.json(data);
   } catch(e) {
