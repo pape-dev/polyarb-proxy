@@ -159,18 +159,30 @@ async function fetchGammaMarkets() {
 }
 
 // [v11] Ne garde que les marchés binaires à 2 jetons (condition nécessaire pour l'arb OUI+NON)
+// [FIX] Polymarket renvoie parfois clobTokenIds comme une CHAÎNE contenant du JSON
+// (ex: '["123...","456..."]') plutôt qu'un vrai tableau — sans ce parsing, le filtre
+// Array.isArray() rejetait silencieusement TOUS les marchés (0 résultat interprété à
+// tort comme "API bloquée", alors que Gamma répondait normalement).
+function getTokenIds(m) {
+  let ids = m.clobTokenIds;
+  if (typeof ids === "string") {
+    try { ids = JSON.parse(ids); } catch { return null; }
+  }
+  return Array.isArray(ids) && ids.length === 2 ? ids : null;
+}
 function parseSingleMarkets(raw) {
   const list = Array.isArray(raw) ? raw : (raw.results ?? raw.markets ?? []);
   return list
-    .filter(m => m.active && !m.closed && Array.isArray(m.clobTokenIds) && m.clobTokenIds.length === 2)
-    .map(m => {
+    .map(m => ({ m, ids: getTokenIds(m) }))
+    .filter(({ m, ids }) => m.active && !m.closed && ids)
+    .map(({ m, ids }) => {
       const cat = engine.categorize(m.question ?? m.slug ?? "", m.slug ?? "");
       return {
         id: m.slug,
         slug: m.slug,
         title: (m.question ?? m.title ?? m.slug).slice(0, 90),
-        tokenYes: m.clobTokenIds[0],
-        tokenNo: m.clobTokenIds[1],
+        tokenYes: ids[0],
+        tokenNo: ids[1],
         volume24h: parseFloat(m.volume24hr ?? m.volume ?? 0),
         liquidity: parseFloat(m.liquidity ?? 0),
         endDate: m.endDate ?? m.endDateIso ?? null,
@@ -184,8 +196,8 @@ function parseSingleMarkets(raw) {
 async function discoverMarketsServer() {
   try {
     const raw = await fetchGammaMarkets();
-    return parseSingleMarkets(raw);
-  } catch(e) { return []; }
+    return { markets: parseSingleMarkets(raw), fetchOk: true, totalRaw: (Array.isArray(raw)?raw:(raw.results??raw.markets??[])).length };
+  } catch(e) { return { markets: [], fetchOk: false, totalRaw: 0 }; }
 }
 
 async function fetchBookServer(tokenId) {
@@ -215,18 +227,21 @@ async function discover() {
   if (bot.discovering) return;
   bot.discovering = true;
   botLog("DISC", "Scan marchés Polymarket (binaires à 2 jetons)…");
-  const markets = await discoverMarketsServer();
-  if (markets.length > 0) {
+  const { markets, fetchOk, totalRaw } = await discoverMarketsServer();
+  if (!fetchOk) {
+    bot.apiSt.gamma = "err";
+    botLog("WARN", "Gamma API inaccessible (voir logs [EXT] pour le détail)");
+  } else if (markets.length === 0) {
     bot.apiSt.gamma = "ok";
-    // Fusionne avec l'existant pour préserver l'état des marchés déjà suivis
+    botLog("WARN", `${totalRaw} marchés reçus mais aucun binaire à 2 jetons éligible`);
+    bot.markets = [];
+  } else {
+    bot.apiSt.gamma = "ok";
     const prevById = {}; bot.markets.forEach(m => prevById[m.id] = m);
     bot.markets = markets.map(m => prevById[m.id] ? { ...m, ...prevById[m.id], title:m.title, volume24h:m.volume24h, liquidity:m.liquidity } : m)
       .sort((a,b)=>b.volume24h-a.volume24h)
-      .slice(0, 60); // limite raisonnable pour ne pas saturer les appels CLOB par cycle
-    botLog("DISC", `${markets.length} marchés binaires → ${bot.markets.length} suivis (top volume)`);
-  } else {
-    bot.apiSt.gamma = "err";
-    botLog("WARN", "Gamma API bloquée");
+      .slice(0, 60);
+    botLog("DISC", `${totalRaw} marchés reçus → ${markets.length} binaires éligibles → ${bot.markets.length} suivis (top volume)`);
   }
   bot.discovering = false;
 }
