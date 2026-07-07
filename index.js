@@ -294,6 +294,8 @@ async function executeOrder(marketId) {
   const m = bot.markets.find(x=>x.id===marketId);
   if (!m) return;
   const c = bot.cfg, br = bot.bankroll, now = Date.now();
+  const today = new Date().toISOString().slice(0,10);
+  if (bot.daily.date !== today) bot.daily = { date: today, count: 0 };
   if ((bot.cooldowns[marketId]??0) > now) return;
   if (bot.daily.count >= c.maxDaily) { botLog("RISK","Limite journalière atteinte"); return; }
   if (!m.arb?.valid) { botLog("WARN", `Signal invalide: ${m.arb?.reason}`); return; }
@@ -371,8 +373,20 @@ async function executeOrder(marketId) {
 }
 
 async function tick() {
-  if (!bot.markets.length) return;
+  // [FIX] Garde anti-chevauchement — sans elle, si un cycle prend plus de temps que
+  // refreshMs (réseau lent, 60 marchés à vérifier), le cycle suivant pourrait démarrer
+  // avant la fin du précédent et déclencher un double trade sur le même signal avant
+  // que la position du premier n'ait eu le temps d'être enregistrée.
+  if (bot.ticking || !bot.markets.length) return;
+  bot.ticking = true;
+  try {
   const c = bot.cfg;
+  // [FIX] Le compteur journalier n'était réinitialisé qu'au démarrage du serveur — au-delà
+  // de maxDaily trades au total (pas par jour), le bot restait bloqué indéfiniment après
+  // minuit. On vérifie la date à chaque cycle.
+  const today = new Date().toISOString().slice(0,10);
+  if (bot.daily.date !== today) bot.daily = { date: today, count: 0 };
+
   const batchSize = 4, delayMs = 200;
   for (let i=0; i<bot.markets.length; i += batchSize) {
     const batch = bot.markets.slice(i, i+batchSize);
@@ -407,6 +421,9 @@ async function tick() {
   }
 
   await persistBotState();
+  } finally {
+    bot.ticking = false;
+  }
 }
 
 let tickTimer = null, discTimer = null;
