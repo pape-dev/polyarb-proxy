@@ -227,11 +227,13 @@ async function fetchBookServer(tokenId) {
   try {
     const r = await fetchExternal(`https://clob.polymarket.com/book?token_id=${encodeURIComponent(tokenId)}`);
     const d = await r.json();
-    return {
-      simulated: false,
-      bids: (d.bids ?? []).slice(0,5).map(b=>({price:+b.price,size:+b.size})),
-      asks: (d.asks ?? []).slice(0,5).map(a=>({price:+a.price,size:+a.size})),
-    };
+    // [FIX] Tri explicite — tout le calcul d'edge suppose que asks[0] est le meilleur prix
+    // (le plus bas) et bids[0] le plus haut. Rien ne garantit que l'API renvoie déjà les
+    // niveaux dans cet ordre ; sans ce tri, un mauvais ordre pourrait faire calculer un
+    // edge basé sur un prix qui n'est pas réellement le meilleur disponible.
+    const asks = (d.asks ?? []).map(a=>({price:+a.price,size:+a.size})).sort((a,b)=>a.price-b.price).slice(0,5);
+    const bids = (d.bids ?? []).map(b=>({price:+b.price,size:+b.size})).sort((a,b)=>b.price-a.price).slice(0,5);
+    return { simulated: false, bids, asks };
   } catch { return { simulated:true, bids:[], asks:[] }; }
 }
 
@@ -273,20 +275,30 @@ function currentExposure() {
   return bot.positions.filter(p=>p.status==="OPEN").reduce((s,p)=>s+p.size,0);
 }
 
-// [v11] Clôture uniquement par résolution du marché — plus de SL/TP : le profit est
-// garanti et connu dès l'ouverture, il n'y a pas de risque de prix résiduel à gérer.
+// [v11] Clôture par résolution du marché — le profit est garanti et connu dès
+// l'ouverture, pas de SL/TP à gérer une fois les deux jambes remplies.
 function closePosition(posId, reason) {
   const idx = bot.positions.findIndex(p=>p.id===posId && p.status==="OPEN");
   if (idx===-1) return;
   const p = bot.positions[idx];
-  const payoff = p.size / p.cost; // n paires de parts * $1 garanti
-  const pnlUSDC = payoff - p.size;
-  bot.bankroll += payoff; // on récupère le capital + profit garanti
   const label = p.label.slice(0,40);
-  const pnlStr = `${pnlUSDC>=0?"+":""}$${pnlUSDC.toFixed(2)}`;
-  if (reason==="RESOLVED") botLog("SETTLE", `RÉSOLU ${label} PnL=${pnlStr}`);
-  else if (reason==="MANUAL") botLog("CLOSE", `${label} PnL=${pnlStr} (clôture manuelle avant résolution — capital non garanti si non résolu)`);
-  else botLog("CLOSE", `${label} PnL=${pnlStr}`);
+  let pnlUSDC;
+  if (reason === "RESOLVED") {
+    // Le marché a réellement résolu → paiement garanti de $1 par paire de parts.
+    const payoff = p.size / p.cost;
+    pnlUSDC = payoff - p.size;
+    bot.bankroll += payoff;
+    botLog("SETTLE", `RÉSOLU ${label} PnL=${pnlUSDC>=0?"+":""}$${pnlUSDC.toFixed(2)}`);
+  } else {
+    // [FIX] MANUAL — le marché n'est PAS confirmé résolu. Aucune vente réelle n'est
+    // exécutée ici (ce bouton ne fait que nettoyer une position bloquée/orpheline côté
+    // suivi interne) : créditer le profit garanti serait mensonger puisque rien ne
+    // prouve que le marché a effectivement résolu. On ne recrédite que le capital
+    // engagé, sans profit fictif, et on le signale clairement dans le log.
+    pnlUSDC = 0;
+    bot.bankroll += p.size;
+    botLog("CLOSE", `${label} — clôture manuelle AVANT résolution confirmée : capital repris ($${p.size.toFixed(2)}), aucun profit crédité (aucune vente réelle exécutée — vérifier manuellement l'état du marché sur Polymarket)`);
+  }
   bot.positions[idx] = { ...p, status:"CLOSED", pnlUSDC, closedAt:new Date().toISOString() };
 }
 
@@ -394,7 +406,10 @@ async function tick() {
       const idx = i+j;
       const closedInfo = await fetchMarketClosedServer(m.slug);
       if (closedInfo.closed) {
-        bot.markets[idx] = { ...m, closed:true };
+        // [FIX] Invalider explicitement le signal — sans ça, arb.valid restait à sa
+        // dernière valeur connue (potentiellement true) et l'autoExec plus bas dans ce
+        // même cycle pouvait ouvrir une NOUVELLE position sur un marché déjà résolu.
+        bot.markets[idx] = { ...m, closed:true, arb:{ valid:false, reason:"CLOSED" }, sizeUSDC:0 };
         // Règle toute position ouverte sur ce marché
         bot.positions.forEach((p,pi) => { if (p.marketId===m.id && p.status==="OPEN") closePosition(p.id, "RESOLVED"); });
         return;
