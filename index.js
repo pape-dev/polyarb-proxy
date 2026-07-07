@@ -153,8 +153,9 @@ async function persistBotState() {
   }
 }
 
-async function fetchGammaMarkets() {
-  const r = await fetchExternal(`https://gamma-api.polymarket.com/markets?limit=500&active=true&order=volume&ascending=false`);
+async function fetchGammaMarkets(tagId) {
+  const tagParam = tagId ? `&tag_id=${encodeURIComponent(tagId)}` : "";
+  const r = await fetchExternal(`https://gamma-api.polymarket.com/markets?limit=500&active=true&order=volume&ascending=false${tagParam}`);
   return await r.json();
 }
 
@@ -170,6 +171,10 @@ function getTokenIds(m) {
   }
   return Array.isArray(ids) && ids.length === 2 ? ids : null;
 }
+// [FIX] Les marchés sport "saison entière" (endDate à plusieurs mois) immobilisent le
+// capital bien plus longtemps qu'un match du jour, pour le même mécanisme d'arb — on
+// les exclut pour prioriser les matchs qui se résolvent sous 14 jours.
+const SPORTS_MAX_DAYS = 14;
 function parseSingleMarkets(raw) {
   const list = Array.isArray(raw) ? raw : (raw.results ?? raw.markets ?? []);
   return list
@@ -190,13 +195,31 @@ function parseSingleMarkets(raw) {
         bookYes: null, bookNo: null, arb: { valid:false, reason:"INIT" },
         sizeUSDC: 0, closed: false,
       };
+    })
+    .filter(m => {
+      if (m.category !== "SPORTS" || !m.endDate) return true;
+      const daysLeft = (new Date(m.endDate) - Date.now()) / 86400000;
+      return daysLeft <= SPORTS_MAX_DAYS && daysLeft >= 0;
     });
 }
 
 async function discoverMarketsServer() {
   try {
-    const raw = await fetchGammaMarkets();
-    return { markets: parseSingleMarkets(raw), fetchOk: true, totalRaw: (Array.isArray(raw)?raw:(raw.results??raw.markets??[])).length };
+    // [FIX] Scan général (top 500 volume, toutes catégories) + scan dédié Sports
+    // (tag_id=100639) en parallèle — sinon les matchs du jour à volume modeste sont
+    // systématiquement exclus du top 500 dominé par la politique/crypto/futures long terme.
+    const [rawGen, rawSports] = await Promise.all([
+      fetchGammaMarkets(),
+      fetchGammaMarkets("100639").catch(() => null),
+    ]);
+    const listGen = Array.isArray(rawGen) ? rawGen : (rawGen.results ?? rawGen.markets ?? []);
+    const listSports = rawSports ? (Array.isArray(rawSports) ? rawSports : (rawSports.results ?? rawSports.markets ?? [])) : [];
+    const seen = new Set(); const mergedRaw = [];
+    for (const m of [...listGen, ...listSports]) {
+      if (seen.has(m.slug)) continue;
+      seen.add(m.slug); mergedRaw.push(m);
+    }
+    return { markets: parseSingleMarkets(mergedRaw), fetchOk: true, totalRaw: mergedRaw.length };
   } catch(e) { return { markets: [], fetchOk: false, totalRaw: 0 }; }
 }
 
@@ -393,6 +416,20 @@ async function startEngine() {
   tickTimer = setInterval(() => { tick().catch(e=>console.error('[TICK]',e.message)); }, Math.max(bot.cfg.refreshMs || 15000, 15000));
   discTimer = setInterval(() => { discover().catch(e=>console.error('[DISC]',e.message)); }, 300000);
   botLog("SYS", "Moteur autonome v11 démarré — arbitrage mécanique, sans corrélation");
+
+  // [FIX] Sans trafic entrant, Render (plan gratuit) met le service en veille après 15 min
+  // d'inactivité — ce qui tuerait le moteur si personne n'a l'app ouverte. On s'auto-ping
+  // toutes les 10 min via notre propre URL publique pour rester éveillé, indépendamment
+  // du navigateur de l'utilisateur.
+  const selfUrl = process.env.RENDER_EXTERNAL_URL;
+  if (selfUrl) {
+    setInterval(() => {
+      fetch(selfUrl).catch(()=>{});
+    }, 600000);
+    botLog("SYS", `Auto-ping activé (${selfUrl}) — le moteur reste actif même sans app ouverte`);
+  } else {
+    botLog("WARN", "RENDER_EXTERNAL_URL absente — le service pourrait s'endormir après 15min sans trafic externe");
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
