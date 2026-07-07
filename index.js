@@ -382,6 +382,12 @@ async function executeOrder(marketId) {
   bot.daily = { ...bot.daily, count: bot.daily.count+1 };
   bot.cooldowns[marketId] = now + c.cooldown;
   botLog("ORDER", `[${mode}] ARB ${m.title.slice(0,40)} coût=${(arbUsed.cost*100).toFixed(1)}¢ $${size.toFixed(2)} edge=${(arbUsed.edge*100).toFixed(1)}%`);
+  // [FIX] Persister IMMÉDIATEMENT après ce trade — l'ancien code ne sauvegardait qu'une
+  // fois à la toute fin du cycle. Si plusieurs trades s'exécutent dans le même cycle et
+  // que le process crashe entre deux, les trades déjà envoyés (potentiellement de vrais
+  // ordres en mode live) disparaissaient du suivi interne au redémarrage, alors que
+  // l'ordre réel, lui, avait bien été passé sur Polymarket.
+  await persistBotState();
 }
 
 async function tick() {
@@ -412,6 +418,7 @@ async function tick() {
         bot.markets[idx] = { ...m, closed:true, arb:{ valid:false, reason:"CLOSED" }, sizeUSDC:0 };
         // Règle toute position ouverte sur ce marché
         bot.positions.forEach((p,pi) => { if (p.marketId===m.id && p.status==="OPEN") closePosition(p.id, "RESOLVED"); });
+        persistBotState().catch(()=>{});
         return;
       }
       const [bookYes, bookNo] = await Promise.all([fetchBookServer(m.tokenYes), fetchBookServer(m.tokenNo)]);
