@@ -99,6 +99,12 @@ const bot = {
   apiSt: { gamma: "boot", clob: "boot" },
   loaded: false,
   discovering: false,
+  ticking: false,
+  tickCount: 0,                          // [v12-11] pour espacer les vérifs de résolution
+  consecutiveErrors: 0,                  // [v12-9] kill-switch erreurs d'exécution
+  paused: false, pausedReason: null,      // [v12-9] kill-switch perte journalière/hebdo
+  week: { start: new Date().toISOString().slice(0,10), startBr: engine.DEFAULT_CFG.bankroll },
+  rejected: [],                          // [v12-8] opportunités refusées (apprentissage passif)
 };
 
 function botLog(kind, msg) {
@@ -125,6 +131,20 @@ async function loadBotState() {
       const today = new Date().toISOString().slice(0,10);
       bot.daily = saved.date === today ? saved : { date: today, count: 0 };
     }
+    // [v12-9] Restaure l'état de pause (kill-switch) — un crash/redémarrage ne doit pas
+    // relancer silencieusement le trading si le bot avait été mis en pause pour une bonne raison.
+    if (s.pa6_risk) {
+      const risk = JSON.parse(s.pa6_risk);
+      bot.paused = !!risk.paused;
+      bot.pausedReason = risk.pausedReason ?? null;
+      bot.consecutiveErrors = risk.consecutiveErrors ?? 0;
+    }
+    if (s.pa6_week) {
+      const week = JSON.parse(s.pa6_week);
+      const weekAgeDays = (Date.now() - new Date(week.start).getTime()) / 86400000;
+      // Rotation hebdomadaire : au-delà de 7 jours, on redémarre la fenêtre de suivi
+      bot.week = weekAgeDays >= 7 ? { start: new Date().toISOString().slice(0,10), startBr: bot.bankroll } : week;
+    }
     botLog("SYS", "État restauré depuis Postgres — moteur v11 (arbitrage mécanique)");
   } catch(e) {
     botLog("SYS", "Démarrage frais — moteur v11");
@@ -141,6 +161,8 @@ async function persistBotState() {
       ["pa6_cfg", JSON.stringify(cfgToSave)],
       ["pa6_startbr", String(bot.startBr)],
       ["pa6_daily", JSON.stringify(bot.daily)],
+      ["pa6_risk", JSON.stringify({ paused: bot.paused, pausedReason: bot.pausedReason, consecutiveErrors: bot.consecutiveErrors })],
+      ["pa6_week", JSON.stringify(bot.week)],
     ];
     for (const [key, value] of entries) {
       await pool.query(
@@ -284,11 +306,12 @@ function closePosition(posId, reason) {
   const label = p.label.slice(0,40);
   let pnlUSDC;
   if (reason === "RESOLVED") {
-    // Le marché a réellement résolu → paiement garanti de $1 par paire de parts.
-    const payoff = p.size / p.cost;
+    // [FIX] Paiement garanti = nombre de parts réellement acquises × $1 (pas size/cost,
+    // qui perdait en précision face à l'arrondi à 2 décimales du moteur v12).
+    const payoff = p.shares ?? (p.size / p.cost);
     pnlUSDC = payoff - p.size;
     bot.bankroll += payoff;
-    botLog("SETTLE", `RÉSOLU ${label} PnL=${pnlUSDC>=0?"+":""}$${pnlUSDC.toFixed(2)}`);
+    botLog("SETTLE", `RÉSOLU ${label} PnL=${pnlUSDC>=0?"+":""}$${pnlUSDC.toFixed(2)} (attendu $${(p.expectedProfit??0).toFixed(2)})`);
   } else {
     // [FIX] MANUAL — le marché n'est PAS confirmé résolu. Aucune vente réelle n'est
     // exécutée ici (ce bouton ne fait que nettoyer une position bloquée/orpheline côté
@@ -302,6 +325,59 @@ function closePosition(posId, reason) {
   bot.positions[idx] = { ...p, status:"CLOSED", pnlUSDC, closedAt:new Date().toISOString() };
 }
 
+// [v12-8] Enregistre une opportunité refusée (borné à 300 entrées) — sert uniquement à
+// l'analyse ultérieure (comparer profit espéré vs jamais réalisé, causes de refus les
+// plus fréquentes par catégorie). Ne modifie JAMAIS les paramètres automatiquement.
+function recordRejected(m, reason) {
+  const a = m.arb ?? {};
+  bot.rejected.push({
+    ts: new Date().toISOString(), marketId: m.id, title: m.title, category: m.category,
+    reason, score: m.score ?? null,
+    // [v13-6] détail complet du calcul refusé — pour l'analyse ultérieure (point 8 :
+    // comparer profit attendu vs réel, causes de refus les plus fréquentes par catégorie)
+    edge: a.edge ?? null, cost: a.cost ?? null,
+    bestAskYes: a.bestAskYes ?? null, bestAskNo: a.bestAskNo ?? null,
+    vwapYes: a.askYes ?? null, vwapNo: a.askNo ?? null,
+    commonShares: a.commonShares ?? null, slippage: a.slippage ?? null,
+    levelsUsedYes: a.levelsUsedYes ?? null, levelsUsedNo: a.levelsUsedNo ?? null,
+  });
+  if (bot.rejected.length > 300) bot.rejected = bot.rejected.slice(-300);
+}
+
+// [v12-9] Comptabilise un échec d'exécution — utilisé par le kill-switch. Ne fait PAS
+// s'arrêter le bot lui-même : ne fait qu'incrémenter, checkRiskLimits() décide de la pause.
+function registerExecutionError() {
+  bot.consecutiveErrors = (bot.consecutiveErrors ?? 0) + 1;
+  if (bot.consecutiveErrors >= (bot.cfg.maxConsecutiveErrors ?? 5)) {
+    bot.paused = true;
+    bot.pausedReason = `${bot.consecutiveErrors} échecs d'exécution consécutifs`;
+    botLog("RISK", `⛔ AUTO-EXECUTE mis en pause : ${bot.pausedReason}. Reprise manuelle requise (POST /bot-resume).`);
+  }
+}
+
+// [v12-9] Vérifie les limites de perte journalière/hebdomadaire après chaque trade —
+// arrêt automatique du trading si dépassées. Ne modifie jamais les paramètres eux-mêmes,
+// seulement le drapeau bot.paused (reprise manuelle explicite requise).
+function checkRiskLimits() {
+  const c = bot.cfg;
+  if (bot.paused) return;
+  const dailyLossPct = bot.startBr > 0 ? (bot.startBr - bot.bankroll) / bot.startBr : 0;
+  if (dailyLossPct >= (c.dailyLossLimitPct ?? 1)) {
+    bot.paused = true;
+    bot.pausedReason = `perte journalière ${(dailyLossPct*100).toFixed(1)}% ≥ limite ${(c.dailyLossLimitPct*100).toFixed(0)}%`;
+    botLog("RISK", `⛔ AUTO-EXECUTE mis en pause : ${bot.pausedReason}`);
+    return;
+  }
+  if (bot.week?.startBr > 0) {
+    const weeklyLossPct = (bot.week.startBr - bot.bankroll) / bot.week.startBr;
+    if (weeklyLossPct >= (c.weeklyLossLimitPct ?? 1)) {
+      bot.paused = true;
+      bot.pausedReason = `perte hebdomadaire ${(weeklyLossPct*100).toFixed(1)}% ≥ limite ${(c.weeklyLossLimitPct*100).toFixed(0)}%`;
+      botLog("RISK", `⛔ AUTO-EXECUTE mis en pause : ${bot.pausedReason}`);
+    }
+  }
+}
+
 async function executeOrder(marketId) {
   const m = bot.markets.find(x=>x.id===marketId);
   if (!m) return;
@@ -310,43 +386,49 @@ async function executeOrder(marketId) {
   if (bot.daily.date !== today) bot.daily = { date: today, count: 0 };
   if ((bot.cooldowns[marketId]??0) > now) return;
   if (bot.daily.count >= c.maxDaily) { botLog("RISK","Limite journalière atteinte"); return; }
-  if (!m.arb?.valid) { botLog("WARN", `Signal invalide: ${m.arb?.reason}`); return; }
-  if (m.sizeUSDC < 1) { botLog("WARN","Taille arb < $1 (liquidité insuffisante)"); return; }
+  // [v12-9] Kill-switch : arrêt automatique si les limites de risque sont déclenchées
+  if (bot.paused) { botLog("RISK", `Trading en pause: ${bot.pausedReason}`); return; }
+  if (!m.arb?.valid) {
+    recordRejected(m, "Signal invalide: " + m.arb?.reason);
+    return;
+  }
+  if (m.sizeUSDC < 1) { recordRejected(m, "Taille arb < $1 (liquidité insuffisante)"); return; }
 
   const expo = currentExposure(), expoMax = br*c.maxExposure;
-  let size = m.sizeUSDC;
-  if (expo+size > expoMax) {
+  let targetSize = m.sizeUSDC;
+  if (expo+targetSize > expoMax) {
     const room = expoMax-expo;
-    if (room < 1) { botLog("RISK","EXPO_LIMIT"); return; }
-    size = room; botLog("RISK", `EXPO_CAP → $${size.toFixed(2)}`);
+    if (room < 1) { recordRejected(m, "EXPO_LIMIT"); return; }
+    targetSize = room; botLog("RISK", `EXPO_CAP → $${targetSize.toFixed(2)}`);
   }
 
   let mode = "PAPER";
-  let arbUsed = m.arb; // [FIX] par défaut l'estimation du dernier tick (mode paper)
+  // [FIX] arbUsed reflète maintenant la forme v12 (roundedShares, realCostUSDC, cost=VWAP)
+  let arbUsed = m.arb;
   const client = await getClobClient();
   if (client) {
     // [FIX 1] Re-vérifier le carnet juste avant d'exécuter — m.arb peut dater de
     // jusqu'à refreshMs (15s) plus tôt ; le prix a pu bouger depuis le dernier scan.
     const [freshYes, freshNo] = await Promise.all([fetchBookServer(m.tokenYes), fetchBookServer(m.tokenNo)]);
-    const freshArb = engine.detectMarketArb(freshYes, freshNo, c);
+    const freshArb = engine.detectMarketArb(freshYes, freshNo, c, targetSize);
     if (!freshArb.valid) {
       botLog("WARN", `Edge disparu entre le scan et l'exécution (${freshArb.reason}) → annulé`);
       return;
     }
     arbUsed = freshArb;
-    const sizeYes = +(size/2/freshArb.askYes).toFixed(2);
-    const sizeNo  = +(size/2/freshArb.askNo).toFixed(2);
+    const shares = freshArb.roundedShares;
     // [FIX 2] Les deux jambes partent EN PARALLÈLE (Promise.allSettled) plutôt qu'en
     // séquence — ça réduit la fenêtre de latence entre les deux ordres pendant laquelle
     // le prix de la seconde jambe pourrait bouger avant même d'être soumise.
     const [rYes, rNo] = await Promise.allSettled([
-      (async()=>{ const o = await client.createOrder({ tokenID:m.tokenYes, price:freshArb.askYes, side:"BUY", size:sizeYes, feeRateBps:0 }); return client.postOrder(o,"FOK"); })(),
-      (async()=>{ const o = await client.createOrder({ tokenID:m.tokenNo, price:freshArb.askNo, side:"BUY", size:sizeNo, feeRateBps:0 }); return client.postOrder(o,"FOK"); })(),
+      (async()=>{ const o = await client.createOrder({ tokenID:m.tokenYes, price:freshArb.askYes, side:"BUY", size:shares, feeRateBps:0 }); return client.postOrder(o,"FOK"); })(),
+      (async()=>{ const o = await client.createOrder({ tokenID:m.tokenNo, price:freshArb.askNo, side:"BUY", size:shares, feeRateBps:0 }); return client.postOrder(o,"FOK"); })(),
     ]);
     const yesOk = rYes.status === "fulfilled", noOk = rNo.status === "fulfilled";
 
     if (yesOk && noOk) {
       mode = "LIVE";
+      bot.consecutiveErrors = 0;
       botLog("EXEC", "Ordres live remplis (2 jambes) ✅");
     } else if (yesOk || noOk) {
       // [FIX 3] REMPLISSAGE PARTIEL — une jambe a rempli, l'autre non. On est exposé
@@ -356,38 +438,103 @@ async function executeOrder(marketId) {
       // capital engagé et non couvert).
       const filledSide = yesOk ? "YES" : "NO";
       const filledToken = yesOk ? m.tokenYes : m.tokenNo;
-      const filledSize = yesOk ? sizeYes : sizeNo;
+      const entryPrice = yesOk ? freshArb.askYes : freshArb.askNo;
       botLog("RISK", `REMPLISSAGE PARTIEL sur ${m.title.slice(0,40)} — jambe ${filledSide} remplie seule, tentative de dénouement immédiat`);
+      registerExecutionError();
       try {
-        const unwindOrder = await client.createOrder({ tokenID: filledToken, price: 0.01, side:"SELL", size: filledSize, feeRateBps:0 });
+        const unwindPrice = 0.01;
+        const unwindOrder = await client.createOrder({ tokenID: filledToken, price: unwindPrice, side:"SELL", size: shares, feeRateBps:0 });
         await client.postOrder(unwindOrder, "FOK");
-        botLog("RISK", `Dénouement réussi — position ${filledSide} revendue, perte limitée au slippage/frais de la manoeuvre`);
+        // [FIX] Une vraie transaction a eu lieu (achat puis revente à perte) — sans
+        // l'enregistrer, la bankroll suivie en interne resterait plus élevée que le
+        // capital réellement disponible sur le portefeuille, un écart qui s'accumulerait
+        // silencieusement à chaque incident de ce type.
+        const realizedLoss = shares * (entryPrice - unwindPrice);
+        bot.bankroll -= realizedLoss;
+        botLog("RISK", `Dénouement réussi — position ${filledSide} revendue, perte réalisée ~$${realizedLoss.toFixed(2)} déduite de la bankroll`);
+        await persistBotState();
+        checkRiskLimits();
       } catch(e) {
-        botLog("ERR", `⚠ DÉNOUEMENT ÉCHOUÉ — position ${filledSide} RESTE OUVERTE ET EXPOSÉE sans couverture sur ${m.title.slice(0,40)}. Intervention manuelle requise. (${e.message})`);
+        botLog("ERR", `⚠ DÉNOUEMENT ÉCHOUÉ — position ${filledSide} RESTE OUVERTE ET EXPOSÉE sans couverture sur ${m.title.slice(0,40)} (${shares} parts à ~${(entryPrice*100).toFixed(1)}¢, capital réel engagé non reflété dans la bankroll suivie). Intervention manuelle requise. (${e.message})`);
       }
       return; // ne crée pas de position "arb" classique — l'incident est déjà loggé
     } else {
-      botLog("WARN", `Aucune des deux jambes n'a rempli (${rYes.reason?.message ?? ""} / ${rNo.reason?.message ?? ""}) → PAPER`);
+      // [FIX CRITIQUE] Aucune des deux jambes n'a rempli — AUCUN capital réel n'a été
+      // engagé. L'ancien code continuait malgré tout vers la création d'une position et
+      // débitait la bankroll comme si un trade avait eu lieu ("→ PAPER" trompeur) : en
+      // mode live, ça aurait fait diverger silencieusement le suivi interne du capital
+      // par rapport au portefeuille réel, à chaque échec d'exécution. On abandonne
+      // proprement, sans toucher à la bankroll ni créer de position fictive.
+      registerExecutionError();
+      botLog("WARN", `Aucune des deux jambes n'a rempli (${rYes.reason?.message ?? ""} / ${rNo.reason?.message ?? ""}) → annulé, aucun capital engagé`);
+      return;
     }
   }
 
+  // [FIX] Le coût réel engagé (realCostUSDC) peut différer légèrement de targetSize à
+  // cause de l'arrondi à 2 décimales des parts — on enregistre le coût RÉEL, pas la
+  // taille visée initialement, pour un suivi de bankroll exact.
+  const realCost = arbUsed.realCostUSDC ?? targetSize;
+  const shares = arbUsed.roundedShares ?? (targetSize / arbUsed.cost);
+  const expectedProfit = engine.calcArbProfit(realCost, arbUsed.cost, arbUsed.edge);
+
   const pos = {
     id: `${marketId}-${now}`, marketId, label: m.title, slug: m.slug,
-    cost: arbUsed.cost, edge: arbUsed.edge, size, ts: new Date().toISOString(),
-    status: "OPEN", mode, pnlUSDC: 0,
+    cost: arbUsed.cost, edge: arbUsed.edge, size: realCost, shares,
+    expectedProfit, // [v12-6/8] pour comparaison profit attendu vs profit réel
+    ts: new Date().toISOString(), status: "OPEN", mode, pnlUSDC: 0,
   };
   bot.positions.push(pos);
-  bot.bankroll -= size;
+  bot.bankroll -= realCost;
   if (bot.daily.count === 0) bot.startBr = br;
   bot.daily = { ...bot.daily, count: bot.daily.count+1 };
   bot.cooldowns[marketId] = now + c.cooldown;
-  botLog("ORDER", `[${mode}] ARB ${m.title.slice(0,40)} coût=${(arbUsed.cost*100).toFixed(1)}¢ $${size.toFixed(2)} edge=${(arbUsed.edge*100).toFixed(1)}%`);
+  botLog("ORDER", `[${mode}] ARB ${m.title.slice(0,40)} VWAP(O/N)=${(arbUsed.askYes*100).toFixed(1)}/${(arbUsed.askNo*100).toFixed(1)}¢ coût=${(arbUsed.cost*100).toFixed(1)}¢ $${realCost.toFixed(2)} edge=${(arbUsed.edge*100).toFixed(1)}% commun=${(arbUsed.commonShares??0).toFixed(2)}parts niv(O/N)=${arbUsed.levelsUsedYes??'-'}/${arbUsed.levelsUsedNo??'-'} slip=${((arbUsed.slippage??0)*100).toFixed(2)}% profit attendu=$${expectedProfit.toFixed(2)}`);
   // [FIX] Persister IMMÉDIATEMENT après ce trade — l'ancien code ne sauvegardait qu'une
   // fois à la toute fin du cycle. Si plusieurs trades s'exécutent dans le même cycle et
   // que le process crashe entre deux, les trades déjà envoyés (potentiellement de vrais
   // ordres en mode live) disparaissaient du suivi interne au redémarrage, alors que
   // l'ordre réel, lui, avait bien été passé sur Polymarket.
   await persistBotState();
+  checkRiskLimits();
+}
+
+// [TEST] Logique de décision pure extraite de tick() — aucune I/O ici, uniquement du
+// calcul à partir de données déjà récupérées. Permet de tester unitairement (sans réseau)
+// le comportement exact utilisé en production.
+// [FIX CRITIQUE] Le moteur v12 calcule l'edge réel (VWAP multi-niveaux) À UNE TAILLE
+// DONNÉE — il faut donc d'abord déterminer une taille candidate (profondeur/bankroll/
+// score), PUIS demander au moteur l'edge réel à cette taille précise. L'ancien code
+// appelait detectMarketArb sans taille cible : il retournait systématiquement
+// "SIZE_NULLE" et ne détectait plus jamais rien.
+function computeMarketUpdate(m, cfg, bankroll, closedInfo, bookYes, bookNo) {
+  if (closedInfo.closed) {
+    return {
+      market: { ...m, closed:true, arb:{ valid:false, reason:"CLOSED" }, sizeUSDC:0, score:0 },
+      shouldClosePositions: true,
+      clobOk: false,
+    };
+  }
+  const clobOk = !bookYes?.simulated || !bookNo?.simulated;
+  // [v12-4] Score composite du marché (liquidité, profondeur, volume, échéance, spread)
+  const score = engine.scoreMarket(m, bookYes, bookNo);
+  const minScore = cfg.minMarketScore ?? 0;
+  if (score < minScore) {
+    return {
+      market: { ...m, bookYes, bookNo, arb: { valid:false, reason:`SCORE_BAS(${score}<${minScore})` }, sizeUSDC:0, score },
+      shouldClosePositions: false, clobOk,
+    };
+  }
+  // Taille candidate d'abord (profondeur réelle + bankroll + facteur de score),
+  // puis edge RÉEL (VWAP + arrondi + frais) recalculé À cette taille précise.
+  const candidateSize = engine.sizeArb(bookYes, bookNo, cfg, bankroll, score);
+  const arb = engine.detectMarketArb(bookYes, bookNo, cfg, candidateSize);
+  const sizeUSDC = arb.valid ? candidateSize : 0;
+  return {
+    market: { ...m, bookYes, bookNo, arb, sizeUSDC, score },
+    shouldClosePositions: false,
+    clobOk,
+  };
 }
 
 async function tick() {
@@ -404,34 +551,44 @@ async function tick() {
   // minuit. On vérifie la date à chaque cycle.
   const today = new Date().toISOString().slice(0,10);
   if (bot.daily.date !== today) bot.daily = { date: today, count: 0 };
+  // [v12-9] Rotation hebdomadaire du suivi de perte
+  const weekAgeDays = (Date.now() - new Date(bot.week.start).getTime()) / 86400000;
+  if (weekAgeDays >= 7) bot.week = { start: today, startBr: bot.bankroll };
+
+  bot.tickCount = (bot.tickCount ?? 0) + 1;
+  // [v12-11] Vérifier la résolution coûte un appel Gamma en plus par marché ; le faire à
+  // CHAQUE cycle (15s) pour 60 marchés = ~180 requêtes externes/15s, un vrai risque de
+  // rate-limit. On l'espace désormais selon cfg.closedCheckEveryNTicks (défaut: 1 fois
+  // sur 4, soit environ toutes les minutes) — le carnet d'ordres, lui, reste vérifié à
+  // chaque cycle car c'est lui qui détermine si un arbitrage est tradable maintenant.
+  const shouldCheckClosed = (bot.tickCount % Math.max(c.closedCheckEveryNTicks ?? 1, 1)) === 0;
 
   const batchSize = 4, delayMs = 200;
   for (let i=0; i<bot.markets.length; i += batchSize) {
     const batch = bot.markets.slice(i, i+batchSize);
     await Promise.all(batch.map(async (m, j) => {
       const idx = i+j;
-      const closedInfo = await fetchMarketClosedServer(m.slug);
-      if (closedInfo.closed) {
-        // [FIX] Invalider explicitement le signal — sans ça, arb.valid restait à sa
-        // dernière valeur connue (potentiellement true) et l'autoExec plus bas dans ce
-        // même cycle pouvait ouvrir une NOUVELLE position sur un marché déjà résolu.
-        bot.markets[idx] = { ...m, closed:true, arb:{ valid:false, reason:"CLOSED" }, sizeUSDC:0 };
-        // Règle toute position ouverte sur ce marché
-        bot.positions.forEach((p,pi) => { if (p.marketId===m.id && p.status==="OPEN") closePosition(p.id, "RESOLVED"); });
-        persistBotState().catch(()=>{});
-        return;
+      const closedInfo = shouldCheckClosed ? await fetchMarketClosedServer(m.slug) : { closed: m.closed ?? false };
+      let bookYes = null, bookNo = null;
+      if (!closedInfo.closed) {
+        [bookYes, bookNo] = await Promise.all([fetchBookServer(m.tokenYes), fetchBookServer(m.tokenNo)]);
       }
-      const [bookYes, bookNo] = await Promise.all([fetchBookServer(m.tokenYes), fetchBookServer(m.tokenNo)]);
-      if (!bookYes?.simulated || !bookNo?.simulated) bot.apiSt.clob = "ok";
-      const arb = engine.detectMarketArb(bookYes, bookNo, c);
-      const sizeUSDC = arb.valid ? engine.sizeArb(bookYes, bookNo, c, bot.bankroll) : 0;
-      if (arb.valid) botLog("SIG", `${m.title.slice(0,40)} coût=${(arb.cost*100).toFixed(1)}¢ edge=${(arb.edge*100).toFixed(1)}% taille=$${sizeUSDC.toFixed(0)}`);
-      bot.markets[idx] = { ...m, bookYes, bookNo, arb, sizeUSDC };
+      const result = computeMarketUpdate(m, c, bot.bankroll, closedInfo, bookYes, bookNo);
+      bot.markets[idx] = result.market;
+      if (result.clobOk) bot.apiSt.clob = "ok";
+      if (result.market.arb?.valid) {
+        const a = result.market.arb;
+        botLog("SIG", `${m.title.slice(0,40)} bestAsk(O/N)=${(a.bestAskYes*100).toFixed(1)}/${(a.bestAskNo*100).toFixed(1)}¢ VWAP(O/N)=${(a.askYes*100).toFixed(1)}/${(a.askNo*100).toFixed(1)}¢ coût=${(a.cost*100).toFixed(1)}¢ edge=${(a.edge*100).toFixed(1)}% commun=${a.commonShares.toFixed(2)}parts niv(O/N)=${a.levelsUsedYes}/${a.levelsUsedNo} slip=${(a.slippage*100).toFixed(2)}% taille=$${result.market.sizeUSDC.toFixed(0)}`);
+      }
+      if (result.shouldClosePositions) {
+        bot.positions.forEach((p) => { if (p.marketId===m.id && p.status==="OPEN") closePosition(p.id, "RESOLVED"); });
+        persistBotState().catch(()=>{});
+      }
     }));
     if (i+batchSize < bot.markets.length) await new Promise(r=>setTimeout(r, delayMs));
   }
 
-  if (c.autoExec === 1) {
+  if (c.autoExec === 1 && !bot.paused) {
     const now = Date.now();
     for (const m of bot.markets) {
       if (!m.arb?.valid) continue;
@@ -490,11 +647,28 @@ app.get('/bot-state', (req, res) => {
     bankroll: bot.bankroll,
     startBr: bot.startBr,
     metrics,
+    holdStats: engine.computeHoldStats(bot.positions), // [v12-6] stats avancées
     apiSt: bot.apiSt,
     discovering: bot.discovering,
     logs: bot.logs.slice(-150),
     daily: bot.daily,
+    week: bot.week,
+    paused: bot.paused,
+    pausedReason: bot.pausedReason,
+    consecutiveErrors: bot.consecutiveErrors,
+    rejected: bot.rejected.slice(-50), // [v12-8] dernières opportunités refusées
   });
+});
+
+// [v12-9] Reprise manuelle explicite après un arrêt du kill-switch — jamais automatique,
+// conformément à la consigne : le système ne modifie/relance jamais seul ses paramètres.
+app.post('/bot-resume', (req, res) => {
+  bot.paused = false;
+  bot.pausedReason = null;
+  bot.consecutiveErrors = 0;
+  botLog("SYS", "Trading repris manuellement après pause");
+  persistBotState().catch(()=>{});
+  res.json({ ok:true });
 });
 
 app.post('/bot-cfg', (req, res) => {
@@ -592,5 +766,21 @@ app.post("/order", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`POLYARB proxy on :${PORT}`));
-initDB().then(startEngine);
+// [TEST] Garde require.main : `node index.js` (production) démarre normalement le
+// serveur et le moteur. `require('./index.js')` depuis un test NE les démarre PAS —
+// aucun changement de comportement en production, ça n'affecte que les tests.
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`POLYARB proxy on :${PORT}`));
+  initDB().then(startEngine);
+}
+
+// [TEST] Exports pour la suite de tests — n'affecte en rien le fonctionnement normal
+// (module.exports n'est lu que par du code qui fait explicitement require('./index.js')).
+module.exports = {
+  app, bot, engine,
+  tick, discover, executeOrder, closePosition, computeMarketUpdate,
+  parseSingleMarkets, getTokenIds, discoverMarketsServer,
+  fetchBookServer, fetchMarketClosedServer, fetchExternal,
+  loadBotState, persistBotState, initDB,
+  recordRejected, registerExecutionError, checkRiskLimits, currentExposure,
+};
