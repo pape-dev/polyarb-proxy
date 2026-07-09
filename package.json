@@ -1,10 +1,12 @@
 {
   "name": "polyarb-proxy",
-  "version": "8.1.0",
-  "description": "POLYARB proxy — corrections: persistance Postgres, routes /price /book /ai, PnL signé BUY/SELL, ordres CLOB signés",
+  "version": "11.1.0",
+  "description": "POLYARB proxy — arbitrage mécanique OUI+NON, moteur serveur autonome, tests automatisés",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test test/",
+    "test:network": "RUN_NETWORK_TESTS=1 node --test test/"
   },
   "dependencies": {
     "express": "^4.19.2",
