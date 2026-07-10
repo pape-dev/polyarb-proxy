@@ -579,6 +579,14 @@ async function tick() {
       if (result.market.arb?.valid) {
         const a = result.market.arb;
         botLog("SIG", `${m.title.slice(0,40)} bestAsk(O/N)=${(a.bestAskYes*100).toFixed(1)}/${(a.bestAskNo*100).toFixed(1)}¢ VWAP(O/N)=${(a.askYes*100).toFixed(1)}/${(a.askNo*100).toFixed(1)}¢ coût=${(a.cost*100).toFixed(1)}¢ edge=${(a.edge*100).toFixed(1)}% commun=${a.commonShares.toFixed(2)}parts niv(O/N)=${a.levelsUsedYes}/${a.levelsUsedNo} slip=${(a.slippage*100).toFixed(2)}% taille=$${result.market.sizeUSDC.toFixed(0)}`);
+      } else if (shouldCheckClosed && result.market.arb?.reason && !["INIT","CLOSED"].includes(result.market.arb.reason)) {
+        // [FIX] recordRejected() n'était en réalité jamais appelée depuis le cycle
+        // principal — seulement dans des cas rares d'appel manuel. Le tableau de
+        // diagnostic "opportunités refusées" restait donc vide en permanence, alors
+        // même qu'il sert justement à répondre à "pourquoi aucun trade ?". On
+        // échantillonne au même rythme que la vérif de résolution (~1x/min) pour
+        // rester représentatif sans saturer le tableau borné à 300 entrées.
+        recordRejected(result.market, result.market.arb.reason);
       }
       if (result.shouldClosePositions) {
         bot.positions.forEach((p) => { if (p.marketId===m.id && p.status==="OPEN") closePosition(p.id, "RESOLVED"); });
@@ -662,6 +670,17 @@ app.get('/bot-state', (req, res) => {
 
 // [v12-9] Reprise manuelle explicite après un arrêt du kill-switch — jamais automatique,
 // conformément à la consigne : le système ne modifie/relance jamais seul ses paramètres.
+// [FIX] Purge les réglages hérités de versions précédentes (ex: minEdge resté à 8%
+// depuis l'ancien moteur par corrélation, jamais mis à jour par les migrations
+// automatiques puisque la fusion cfg préserve toujours les valeurs déjà sauvegardées).
+app.post('/bot-cfg/reset', (req, res) => {
+  const oldCfg = { ...bot.cfg };
+  bot.cfg = { ...engine.DEFAULT_CFG };
+  botLog("SYS", `Config réinitialisée aux valeurs par défaut (ancien minEdge=${oldCfg.minEdge}, nouveau=${bot.cfg.minEdge})`);
+  persistBotState().catch(()=>{});
+  res.json({ ok:true, cfg: bot.cfg });
+});
+
 app.post('/bot-resume', (req, res) => {
   bot.paused = false;
   bot.pausedReason = null;
