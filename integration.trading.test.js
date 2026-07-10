@@ -14,7 +14,8 @@ const { makeMarket, makeBook } = require('./helpers/fixtures');
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test:test@localhost:5432/testdb';
 const idx = require('../index.js');
 const { bot, engine, executeOrder, closePosition, computeMarketUpdate, tick, currentExposure,
-        recordRejected, registerExecutionError, checkRiskLimits, app } = idx;
+        recordRejected, registerExecutionError, checkRiskLimits, app,
+        shouldSkipBookFetch, computeNextCheckTick, computeApiHealth, classifyApi, apiMetrics } = idx;
 
 const TODAY = () => new Date().toISOString().slice(0,10);
 
@@ -151,6 +152,74 @@ test('closePosition("MANUAL"): [régression critique] NE crédite AUCUN profit f
 
 test('closePosition: ignore un id de position inconnu ou déjà clôturé (aucun crash)', () => {
   assert.doesNotThrow(() => closePosition('id-inexistant', 'RESOLVED'));
+});
+
+// ─── [v14-4] shouldSkipBookFetch / computeNextCheckTick — throttling réseau ────
+test('shouldSkipBookFetch: ne saute jamais un marché actif (liquidité/volume au-dessus des seuils)', () => {
+  const m = makeMarket({ liquidity: 100000, volume24h: 100000 });
+  const cfg = { lowActivityLiquidityThreshold:1000, lowActivityVolumeThreshold:1000, staleRescanEveryNTicks:20 };
+  assert.equal(shouldSkipBookFetch(m, cfg, 5), false);
+});
+test('shouldSkipBookFetch: saute un marché peu actif pas encore dû pour vérification', () => {
+  const m = makeMarket({ liquidity: 10, volume24h: 10, nextCheckTick: 50 });
+  const cfg = { lowActivityLiquidityThreshold:1000, lowActivityVolumeThreshold:1000, staleRescanEveryNTicks:1000 };
+  assert.equal(shouldSkipBookFetch(m, cfg, 10), true);
+});
+test('shouldSkipBookFetch: ne saute jamais si le cycle correspond au rescan de sécurité périodique', () => {
+  const m = makeMarket({ liquidity: 10, volume24h: 10, nextCheckTick: 999999 });
+  const cfg = { lowActivityLiquidityThreshold:1000, lowActivityVolumeThreshold:1000, staleRescanEveryNTicks:20 };
+  assert.equal(shouldSkipBookFetch(m, cfg, 40), false, 'tick 40 est un multiple de 20 → rescan forcé, jamais ignoré définitivement');
+});
+test('computeNextCheckTick: aucun délai si le marché est redevenu actif', () => {
+  const cfg = { lowActivityLiquidityThreshold:1000, lowActivityVolumeThreshold:1000, lowActivitySkipTicks:5 };
+  const newMarket = makeMarket({ liquidity: 50000, volume24h: 50000, arb:{cost:0.9} });
+  assert.equal(computeNextCheckTick({cost:0.9}, newMarket, cfg, 10), 10);
+});
+test('computeNextCheckTick: aucun délai si le coût a changé de façon significative (retour possible à une opportunité)', () => {
+  const cfg = { lowActivityLiquidityThreshold:1000, lowActivityVolumeThreshold:1000, lowActivitySkipTicks:5 };
+  const newMarket = makeMarket({ liquidity: 10, volume24h: 10, arb:{cost:0.80} });
+  assert.equal(computeNextCheckTick({cost:0.98}, newMarket, cfg, 10), 10, 'changement de coût détecté → pas de mise en veille');
+});
+test('computeNextCheckTick: reporte la prochaine vérification si le marché reste peu actif et inchangé', () => {
+  const cfg = { lowActivityLiquidityThreshold:1000, lowActivityVolumeThreshold:1000, lowActivitySkipTicks:5 };
+  const newMarket = makeMarket({ liquidity: 10, volume24h: 10, arb:{cost:0.98} });
+  assert.equal(computeNextCheckTick({cost:0.9799}, newMarket, cfg, 10), 15, 'coût quasi-identique + peu actif → prochain check dans 5 cycles');
+});
+
+// ─── [v14-3] Surveillance API — comptage et agrégation ─────────────────
+test('classifyApi: identifie correctement Gamma et CLOB par nom d\'hôte', () => {
+  assert.equal(classifyApi('https://gamma-api.polymarket.com/markets'), 'gamma');
+  assert.equal(classifyApi('https://clob.polymarket.com/book?token_id=1'), 'clob');
+  assert.equal(classifyApi('https://api.anthropic.com/v1/messages'), 'other');
+});
+test('computeApiHealth: 100% de disponibilité tant qu\'aucune requête n\'a échoué', () => {
+  apiMetrics.gamma.totalRequests = 10; apiMetrics.gamma.totalErrors = 0; apiMetrics.gamma.responseTimes = [100,120,90];
+  const health = computeApiHealth();
+  assert.equal(health.gamma.availability, 1);
+  assert.equal(health.gamma.errorRate, 0);
+  assert.ok(health.gamma.avgResponseMs > 0);
+});
+test('computeApiHealth: le taux d\'erreur et la disponibilité reflètent les échecs enregistrés', () => {
+  apiMetrics.clob.totalRequests = 10; apiMetrics.clob.totalErrors = 3; apiMetrics.clob.responseTimes = [50,60];
+  const health = computeApiHealth();
+  assert.ok(Math.abs(health.clob.errorRate - 0.3) < 1e-9);
+  assert.ok(Math.abs(health.clob.availability - 0.7) < 1e-9);
+});
+test('computeApiHealth: jamais de crash sur une API sans aucune requête enregistrée', () => {
+  apiMetrics.other.totalRequests = 0; apiMetrics.other.totalErrors = 0; apiMetrics.other.responseTimes = [];
+  const health = computeApiHealth();
+  assert.equal(health.other.availability, 1, 'disponibilité neutre par défaut, pas de division par zéro');
+  assert.equal(health.other.avgResponseMs, 0);
+});
+
+// ─── [v14-1] Classement câblé dans l'auto-exécution ────────────────────
+test('tick() + autoExec: exécute les opportunités valides sans crasher même en présence de plusieurs candidats simultanés', async () => {
+  bot.cfg.autoExec = 1;
+  seedValidMarket({ id: 'rank-m1' });
+  seedValidMarket({ id: 'rank-m2' });
+  // On ne peut pas exercer le réseau ici (pas de connexion) — tick() gérera les échecs
+  // de fetchBookServer/fetchMarketClosedServer via leurs fallbacks déjà testés ailleurs.
+  await assert.doesNotReject(() => tick());
 });
 
 // ─── computeMarketUpdate — régressions ciblées ─────────────────────────
