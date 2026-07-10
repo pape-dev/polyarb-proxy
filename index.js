@@ -32,9 +32,65 @@ async function getClobClient() {
   }
 }
 
+// ─── [v14-3] SURVEILLANCE AVANCÉE DES API (Gamma / CLOB) ──────────────────
+// PROBLÈME RÉSOLU : jusqu'ici, les seules traces de la santé des API externes étaient
+// les logs bruts [EXT] (un par appel, non agrégés) et le badge simplifié apiSt.gamma/
+// clob ("ok"/"err"/"boot"). Impossible de répondre à "la latence Gamma se dégrade-t-elle
+// progressivement ?" ou "quel est le taux d'erreur réel sur la dernière heure ?".
+// RISQUES ÉVITÉS : ces métriques sont PUREMENT informatives (exposées en lecture via
+// /bot-state) — aucune logique de trading ne les consulte ni n'en dépend. Le moteur ne
+// modifie jamais son comportement automatiquement en fonction de ces chiffres, comme
+// demandé : c'est un tableau de bord, pas un déclencheur.
+// CHOIX TECHNIQUE : classification par nom d'hôte dans l'URL (gamma-api vs clob), un seul
+// point d'instrumentation (fetchExternal, déjà le passage obligé de tous les appels
+// externes) plutôt que d'instrumenter chaque fonction d'appel individuellement —
+// garantit qu'aucun appel réseau ne peut échapper au comptage par erreur d'oubli.
+const apiMetrics = {
+  gamma: { totalRequests:0, totalErrors:0, responseTimes:[], incidents:[] },
+  clob:  { totalRequests:0, totalErrors:0, responseTimes:[], incidents:[] },
+  other: { totalRequests:0, totalErrors:0, responseTimes:[], incidents:[] },
+};
+function classifyApi(url) {
+  if (url.includes('gamma-api.polymarket.com')) return 'gamma';
+  if (url.includes('clob.polymarket.com')) return 'clob';
+  return 'other';
+}
+function recordApiCall(api, durationMs, ok, errorMsg) {
+  const m = apiMetrics[api] ?? apiMetrics.other;
+  m.totalRequests++;
+  if (!ok) {
+    m.totalErrors++;
+    m.incidents.push({ ts: new Date().toISOString(), error: (errorMsg||"").slice(0,200) });
+    if (m.incidents.length > 20) m.incidents = m.incidents.slice(-20); // borné, pas de fuite mémoire
+  }
+  m.responseTimes.push(durationMs);
+  if (m.responseTimes.length > 200) m.responseTimes = m.responseTimes.slice(-200); // idem
+}
+// Agrégation à la demande (jamais recalculée en continu) — lue uniquement par /bot-state.
+function computeApiHealth() {
+  const out = {};
+  for (const [name, m] of Object.entries(apiMetrics)) {
+    const times = m.responseTimes;
+    const avg = times.length ? times.reduce((s,v)=>s+v,0)/times.length : 0;
+    const max = times.length ? Math.max(...times) : 0;
+    out[name] = {
+      totalRequests: m.totalRequests,
+      totalErrors: m.totalErrors,
+      errorRate: m.totalRequests > 0 ? m.totalErrors / m.totalRequests : 0,
+      availability: m.totalRequests > 0 ? 1 - (m.totalErrors / m.totalRequests) : 1,
+      avgResponseMs: Math.round(avg),
+      maxResponseMs: Math.round(max),
+      recentIncidents: m.incidents.slice(-10),
+    };
+  }
+  return out;
+}
+
 async function fetchExternal(url, opts = {}, timeoutMs = 12000) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
+  const apiName = classifyApi(url);         // [v14-3]
+  const startedAt = Date.now();             // [v14-3]
   try {
     const r = await fetch(url, {
       ...opts,
@@ -49,12 +105,17 @@ async function fetchExternal(url, opts = {}, timeoutMs = 12000) {
     if (!r.ok) {
       const body = await r.text().catch(() => "");
       console.error(`[EXT] ${url} → HTTP ${r.status} — ${body.slice(0, 200)}`);
+      recordApiCall(apiName, Date.now()-startedAt, false, `HTTP ${r.status}`); // [v14-3]
       throw new Error(`HTTP ${r.status}`);
     }
+    recordApiCall(apiName, Date.now()-startedAt, true, null); // [v14-3]
     return r;
   } catch (e) {
     clearTimeout(t);
     console.error(`[EXT] ${url} → ÉCHEC: ${e.message}`);
+    // [v14-3] Si l'erreur vient du throw HTTP ci-dessus, l'appel est déjà comptabilisé —
+    // on ne le recompte pas une deuxième fois (sinon un seul échec compterait double).
+    if (!e.message.startsWith('HTTP ')) recordApiCall(apiName, Date.now()-startedAt, false, e.message);
     throw e;
   }
 }
@@ -105,13 +166,37 @@ const bot = {
   paused: false, pausedReason: null,      // [v12-9] kill-switch perte journalière/hebdo
   week: { start: new Date().toISOString().slice(0,10), startBr: engine.DEFAULT_CFG.bankroll },
   rejected: [],                          // [v12-8] opportunités refusées (apprentissage passif)
+  eventCounters: {},                     // [v14-5] compteur par type d'événement (kind) depuis le démarrage
+  lastSummaryAt: Date.now(),             // [v14-5] pour espacer les résumés périodiques
 };
+
+// [v14-5] PROBLÈME RÉSOLU : les logs bruts (jusqu'à 400 lignes conservées) permettent de
+// voir un événement précis, mais pas de répondre vite à "combien de SIG/ORDER/WARN
+// depuis le démarrage ?" sans compter les lignes à la main. Un compteur par type,
+// incrémenté au même endroit que chaque log (donc jamais désynchronisé du journal),
+// répond à ce besoin sans surcoût perceptible (un `++` sur un objet en mémoire).
+const SUMMARY_INTERVAL_MS = 30 * 60 * 1000; // résumé périodique toutes les 30 min
 
 function botLog(kind, msg) {
   const ts = new Date().toISOString().slice(11,22);
   bot.logs.push({ ts, kind, msg, id: Date.now()+Math.random() });
-  if (bot.logs.length > 400) bot.logs = bot.logs.slice(-400);
   console.log(`[BOT ${kind}] ${msg}`);
+  // [v14-5] Compteur par type — jamais réinitialisé automatiquement (compteur de vie du
+  // process), remis à zéro seulement par un redémarrage du serveur.
+  bot.eventCounters[kind] = (bot.eventCounters[kind] ?? 0) + 1;
+  // [v14-5] Résumé périodique — volontairement ESPACÉ (30 min) et volontairement exclu
+  // de son propre comptage (pas de log "SYS" recursif à chaque résumé) pour ne jamais
+  // gonfler artificiellement le volume de journalisation, comme demandé.
+  if (Date.now() - bot.lastSummaryAt >= SUMMARY_INTERVAL_MS) {
+    bot.lastSummaryAt = Date.now();
+    const c = bot.eventCounters;
+    const summary = `Résumé 30min — SIG:${c.SIG??0} ORDER:${c.ORDER??0} CLOSE:${c.CLOSE??0} SETTLE:${c.SETTLE??0} RISK:${c.RISK??0} WARN:${c.WARN??0} ERR:${c.ERR??0} | bankroll=$${bot.bankroll.toFixed(2)} | ${bot.markets.length} marchés suivis | ${bot.positions.filter(p=>p.status==="OPEN").length} positions ouvertes`;
+    bot.logs.push({ ts: new Date().toISOString().slice(11,22), kind:"SYS", msg:summary, id: Date.now()+Math.random() });
+    console.log(`[BOT SYS] ${summary}`);
+  }
+  // [FIX] Retronqué APRÈS l'ajout éventuel du résumé ci-dessus, sinon ce dernier pourrait
+  // pousser le journal à 402 entrées sans jamais être ramené à la limite de 400.
+  if (bot.logs.length > 400) bot.logs = bot.logs.slice(-400);
 }
 
 async function loadBotState() {
@@ -537,6 +622,36 @@ function computeMarketUpdate(m, cfg, bankroll, closedInfo, bookYes, bookNo) {
   };
 }
 
+// [v14-4] PROBLÈME RÉSOLU : avec 60 marchés suivis, la majorité sont peu liquides et
+// leur coût combiné (OUI+NON) ne bouge quasiment jamais entre deux cycles — interroger
+// leur carnet toutes les 15s est un appel réseau presque toujours pour rien. On espace
+// ces vérifications SANS jamais ignorer un marché définitivement (voir forceRescan).
+// RISQUES ÉVITÉS : un marché qui redevient intéressant (regain de liquidité, mouvement
+// de prix) doit être détecté — d'où le double filet de sécurité : un rescan complet
+// forcé périodique (staleRescanEveryNTicks) ET une remise à zéro immédiate dès qu'un
+// changement de coût est observé lors d'une vérification (retour à un suivi normal).
+function shouldSkipBookFetch(m, cfg, tickCount) {
+  const isLowActivity = (m.liquidity ?? 0) < (cfg.lowActivityLiquidityThreshold ?? 0)
+                      && (m.volume24h ?? 0) < (cfg.lowActivityVolumeThreshold ?? 0);
+  if (!isLowActivity) return false; // marché actif → jamais throttlé
+  const forceRescan = (tickCount % Math.max(cfg.staleRescanEveryNTicks ?? 1, 1)) === 0;
+  if (forceRescan) return false; // filet de sécurité périodique → jamais ignoré définitivement
+  return tickCount < (m.nextCheckTick ?? 0);
+}
+// Calcule le prochain cycle où ce marché devra être revérifié, à appeler UNIQUEMENT
+// après une vérification réellement effectuée (pas après un cycle sauté).
+function computeNextCheckTick(prevArb, newMarket, cfg, tickCount) {
+  const stillLowActivity = (newMarket.liquidity ?? 0) < (cfg.lowActivityLiquidityThreshold ?? 0)
+                         && (newMarket.volume24h ?? 0) < (cfg.lowActivityVolumeThreshold ?? 0);
+  if (!stillLowActivity) return tickCount; // redevenu actif → aucun délai, vérifié au prochain cycle
+  const prevCost = prevArb?.cost, newCost = newMarket.arb?.cost;
+  const changed = prevCost == null || newCost == null || Math.abs(newCost - prevCost) > 0.005;
+  // Un changement de coût détecté = signal d'un possible retour à une situation
+  // intéressante → on ne le laisse PAS s'endormir, contrairement à un marché
+  // véritablement figé qui peut être vérifié moins souvent en toute sécurité.
+  return changed ? tickCount : tickCount + (cfg.lowActivitySkipTicks ?? 1);
+}
+
 async function tick() {
   // [FIX] Garde anti-chevauchement — sans elle, si un cycle prend plus de temps que
   // refreshMs (réseau lent, 60 marchés à vérifier), le cycle suivant pourrait démarrer
@@ -569,11 +684,21 @@ async function tick() {
     await Promise.all(batch.map(async (m, j) => {
       const idx = i+j;
       const closedInfo = shouldCheckClosed ? await fetchMarketClosedServer(m.slug) : { closed: m.closed ?? false };
-      let bookYes = null, bookNo = null;
-      if (!closedInfo.closed) {
+      let bookYes = m.bookYes, bookNo = m.bookNo; // [v14-4] réutilisées par défaut si le cycle est sauté
+      // [v14-4] Marché peu actif (faible liquidité+volume) et pas encore dû pour un
+      // rescan → on réutilise le dernier carnet connu au lieu de re-solliciter l'API,
+      // sauf si le rescan périodique de sécurité tombe sur ce cycle précis.
+      const skipBookFetch = !closedInfo.closed && shouldSkipBookFetch(m, c, bot.tickCount);
+      if (!closedInfo.closed && !skipBookFetch) {
         [bookYes, bookNo] = await Promise.all([fetchBookServer(m.tokenYes), fetchBookServer(m.tokenNo)]);
       }
       const result = computeMarketUpdate(m, c, bot.bankroll, closedInfo, bookYes, bookNo);
+      // [v14-4] Planifie la prochaine vérification réelle — uniquement quand une
+      // vérification a effectivement eu lieu ce cycle (jamais après un cycle sauté,
+      // sinon le délai s'accumulerait indéfiniment sans jamais revérifier le marché).
+      result.market.nextCheckTick = skipBookFetch
+        ? (m.nextCheckTick ?? bot.tickCount)
+        : computeNextCheckTick(m.arb, result.market, c, bot.tickCount);
       bot.markets[idx] = result.market;
       if (result.clobOk) bot.apiSt.clob = "ok";
       if (result.market.arb?.valid) {
@@ -598,11 +723,18 @@ async function tick() {
 
   if (c.autoExec === 1 && !bot.paused) {
     const now = Date.now();
-    for (const m of bot.markets) {
-      if (!m.arb?.valid) continue;
-      if (m.sizeUSDC < 1) continue;
-      if ((bot.cooldowns[m.id]??0) > now) continue;
-      if (bot.positions.some(p=>p.marketId===m.id && p.status==="OPEN")) continue;
+    // [v14-1] Filtre d'abord tous les candidats exécutables (mêmes conditions qu'avant,
+    // aucun changement de règle), PUIS les classe par qualité décroissante avant de les
+    // exécuter dans cet ordre — au lieu de l'ordre de bot.markets (trié par volume24h,
+    // un critère de découverte, pas de qualité d'arbitrage). À un seul candidat, le tri
+    // est un no-op : comportement strictement identique à avant dans ce cas.
+    const candidates = bot.markets.filter(m =>
+      m.arb?.valid && m.sizeUSDC >= 1 &&
+      (bot.cooldowns[m.id]??0) <= now &&
+      !bot.positions.some(p=>p.marketId===m.id && p.status==="OPEN")
+    );
+    candidates.sort((a,b) => engine.rankOpportunity(b) - engine.rankOpportunity(a));
+    for (const m of candidates) {
       await executeOrder(m.id);
     }
   }
@@ -657,15 +789,32 @@ app.get('/bot-state', (req, res) => {
     metrics,
     holdStats: engine.computeHoldStats(bot.positions), // [v12-6] stats avancées
     apiSt: bot.apiSt,
+    apiHealth: computeApiHealth(), // [v14-3] surveillance avancée Gamma/CLOB (lecture seule)
     discovering: bot.discovering,
     logs: bot.logs.slice(-150),
+    eventCounters: bot.eventCounters, // [v14-5] compteurs par type d'événement depuis le démarrage
     daily: bot.daily,
     week: bot.week,
     paused: bot.paused,
     pausedReason: bot.pausedReason,
     consecutiveErrors: bot.consecutiveErrors,
     rejected: bot.rejected.slice(-50), // [v12-8] dernières opportunités refusées
+    rejectedStats: engine.computeRejectedStats(bot.rejected), // [v14-2] agrégation exploitable, purement passive
   });
+});
+
+// [v14-2] Route dédiée aux statistiques de rejet — mêmes données que le champ
+// rejectedStats de /bot-state, exposées séparément pour un accès direct/léger sans
+// devoir télécharger tout l'état du bot (marchés, positions, logs...).
+app.get('/bot-rejected-stats', (req, res) => {
+  res.json(engine.computeRejectedStats(bot.rejected));
+});
+
+// [v14-3] Route dédiée à la santé des API — mêmes données que apiHealth dans
+// /bot-state, exposées séparément pour un monitoring externe léger (ex. un service
+// de supervision qui ne s'intéresse qu'à la disponibilité, pas à l'état complet du bot).
+app.get('/bot-api-health', (req, res) => {
+  res.json(computeApiHealth());
 });
 
 // [v12-9] Reprise manuelle explicite après un arrêt du kill-switch — jamais automatique,
@@ -802,4 +951,6 @@ module.exports = {
   fetchBookServer, fetchMarketClosedServer, fetchExternal,
   loadBotState, persistBotState, initDB,
   recordRejected, registerExecutionError, checkRiskLimits, currentExposure,
+  shouldSkipBookFetch, computeNextCheckTick,          // [v14-4]
+  computeApiHealth, classifyApi, apiMetrics,           // [v14-3]
 };
