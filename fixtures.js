@@ -33,6 +33,13 @@ function makeMarket(overrides = {}) {
     arb: overrides.arb ?? { valid:false, reason:'INIT' },
     sizeUSDC: overrides.sizeUSDC ?? 0,
     closed: overrides.closed ?? false,
+    // Laisse passer tout champ supplémentaire non listé ci-dessus (ex. `score`,
+    // ajouté par le moteur v12 mais pas un champ "de base" du marché) — sans ce spread,
+    // ces champs étaient silencieusement perdus par la fixture.
+    ...Object.fromEntries(Object.entries(overrides).filter(([k]) => ![
+      'id','slug','title','tokenYes','tokenNo','volume24h','liquidity','endDate',
+      'category','emoji','bookYes','bookNo','arb','sizeUSDC','closed',
+    ].includes(k))),
   };
 }
 
