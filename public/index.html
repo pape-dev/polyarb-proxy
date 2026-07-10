@@ -91,12 +91,22 @@ function useStore() {
     fetch('/bot-discover', { method:'POST' }).catch(()=>{});
   },[]);
 
+  const resetCfg = useCallback(async()=>{
+    try {
+      const r = await fetch('/bot-cfg/reset', { method:'POST' });
+      if (r.ok) {
+        const body = await r.json();
+        if (body.cfg) setCfgLocal(body.cfg);
+      }
+    } catch {}
+  },[]);
+
   const currentExposure = useCallback(()=>{
     return positions.filter(p=>p.status==="OPEN").reduce((s,p)=>s+p.size,0);
   },[positions]);
 
   return{cfg,setCfg,bankroll,startBr,markets,positions,logs,metrics,apiSt,tab,setTab,
-         discovering,execute,closePos,discover,currentExposure};
+         discovering,execute,closePos,discover,resetCfg,currentExposure};
 }
 
 // ─── UI ─────────────────────────────────────────────────────────
@@ -214,7 +224,8 @@ function LogRow({e}){
   );
 }
 
-function ConfigPanel({cfg,setCfg,onDiscover,discovering}){
+function ConfigPanel({cfg,setCfg,onDiscover,discovering,onResetCfg}){
+  const [confirmReset,setConfirmReset]=useState(false);
   const row=(key,label,min,max,step,fmt)=>(
     <div style={{marginBottom:8}}>
       <div style={{display:"flex",justifyContent:"space-between",marginBottom:2}}>
@@ -253,6 +264,22 @@ function ConfigPanel({cfg,setCfg,onDiscover,discovering}){
         {discovering?"SCAN EN COURS…":"REDÉCOUVRIR MARCHÉS"}
       </button>
 
+      <button
+        onClick={()=>{
+          if(!confirmReset){ setConfirmReset(true); setTimeout(()=>setConfirmReset(false),4000); return; }
+          onResetCfg(); setConfirmReset(false);
+        }}
+        style={{marginTop:8,width:"100%",background:confirmReset?CLR.redD:"transparent",
+          border:`1px solid ${confirmReset?CLR.red:CLR.muted}`,color:confirmReset?CLR.red:CLR.muted,
+          padding:"7px",fontSize:9,fontWeight:700,letterSpacing:1,cursor:"pointer",borderRadius:2,fontFamily:"inherit"}}>
+        {confirmReset?"CONFIRMER LA RÉINITIALISATION ?":"RÉINITIALISER CONFIG AUX DÉFAUTS"}
+      </button>
+      <div style={{fontSize:7,color:CLR.muted,marginTop:4,lineHeight:1.5}}>
+        Utile si des réglages d'une version précédente sont restés bloqués (ex. un seuil
+        d'edge hérité de l'ancien moteur, jamais mis à jour automatiquement). Remet tous
+        les paramètres ci-dessus à leurs valeurs par défaut actuelles.
+      </div>
+
       <div style={{marginTop:16,padding:"8px 10px",background:"rgba(0,207,255,.05)",border:"1px solid rgba(0,207,255,.25)",borderRadius:2,fontSize:7,color:CLR.txt2,lineHeight:1.6}}>
         <b style={{color:CLR.cyan}}>ℹ COMMENT ÇA MARCHE</b><br/>
         Chaque marché binaire a 2 jetons (OUI/NON) qui paient $1 ensemble à la résolution.
@@ -284,7 +311,7 @@ select:focus{outline:none;}
 function PolyArb() {
   const store=useStore();
   const{cfg,setCfg,bankroll,startBr,markets,positions,logs,metrics,apiSt,tab,setTab,
-        discovering,execute,closePos,discover,currentExposure}=store;
+        discovering,execute,closePos,discover,resetCfg,currentExposure}=store;
 
   const [scanFilter,setScanFilter]=useState("all");
   const [scanSort,setScanSort]=useState("edge");
@@ -398,7 +425,7 @@ function PolyArb() {
               ?<div style={{padding:16,color:CLR.muted,fontSize:8}}>En attente…</div>
               :[...logs].reverse().map(e=><LogRow key={e.id} e={e}/>)
             )}
-            {tab==="cfg"&&<ConfigPanel cfg={cfg} setCfg={setCfg} onDiscover={discover} discovering={discovering}/>}
+            {tab==="cfg"&&<ConfigPanel cfg={cfg} setCfg={setCfg} onDiscover={discover} discovering={discovering} onResetCfg={resetCfg}/>}
           </div>
         </div>
       </div>
