@@ -315,6 +315,88 @@ function computeHoldStats(positions) {
   return { avgHoldHours, avgAnnualizedReturn, avgExpectedVsActual, arbFrequencyPerDay };
 }
 
+// ─── [v14-1] CLASSEMENT DES OPPORTUNITÉS SIMULTANÉES ──────────────────────
+// PROBLÈME RÉSOLU : jusqu'ici, quand plusieurs arbitrages valides étaient exécutables
+// dans le même cycle, le moteur les traitait dans l'ordre où ils apparaissaient dans
+// bot.markets (trié par volume24h, un critère de découverte, pas de qualité d'arb).
+// Avec des limites de risque (maxDaily, maxExposure) qui peuvent être atteintes avant
+// d'avoir traité tous les candidats, l'ordre de traitement compte : mieux vaut saisir
+// les meilleures opportunités en premier plutôt que les premières trouvées par hasard.
+// RISQUES ÉVITÉS : sans classement, deux arbitrages au même moment (un excellent à 8%
+// d'edge très liquide, un médiocre à 3.1% peu liquide) pouvaient être exécutés dans
+// n'importe quel ordre — le médiocre pouvait consommer le budget d'exposition avant
+// que le bot n'atteigne l'excellent. Le classement corrige ça sans jamais changer le
+// comportement à une seule opportunité (trier un tableau à 1 élément est un no-op).
+// CHOIX TECHNIQUE : pondération simple et transparente (somme pondérée de composantes
+// normalisées 0-100) plutôt qu'un modèle plus complexe — reste auditable et cohérent
+// avec le reste du moteur (cf. scoreMarket, déjà construit sur ce principe). Le score
+// de qualité du marché (scoreMarket) est réutilisé tel quel, pas recalculé.
+function rankOpportunity(market) {
+  const a = market.arb;
+  if (!a || !a.valid) return -Infinity; // ne devrait jamais être classé si invalide
+  const expectedProfit = calcArbProfit(market.sizeUSDC || 0, a.cost, a.edge);
+  // Chaque composante ramenée grossièrement sur une échelle ~0-100 avant pondération,
+  // pour qu'aucune métrique à grande échelle (ex. liquidité en $) n'écrase les autres
+  // (edge en points de %) dans la somme finale.
+  const edgeScore       = clamp(a.edge * 100, 0, 100);
+  const profitScore     = clamp(expectedProfit, 0, 1000) / 10;
+  const liquidityScore  = clamp(Math.log10((market.liquidity ?? 0) + 1) * 10, 0, 100);
+  const volumeScore     = clamp(Math.log10((market.volume24h ?? 0) + 1) * 10, 0, 100);
+  const slippagePenalty = clamp((a.slippage ?? 0) * 100, 0, 100);
+  const qualityScore    = clamp(market.score ?? 50, 0, 100);
+  return edgeScore      * 0.30
+       + profitScore    * 0.25
+       + qualityScore   * 0.20
+       + liquidityScore * 0.10
+       + volumeScore    * 0.10
+       - slippagePenalty* 0.15;
+}
+
+// ─── [v14-2] STATISTIQUES SUR LES OPPORTUNITÉS REFUSÉES ───────────────────
+// PROBLÈME RÉSOLU : bot.rejected existait déjà (journal passif) mais restait un simple
+// tableau brut — utile pour inspecter une entrée à la fois, pas pour répondre à "quelle
+// est la raison de refus la plus fréquente ?" ou "combien de profit potentiel a-t-on
+// laissé filer ?". Cette fonction agrège le journal existant SANS jamais le modifier ni
+// influencer le moteur : purement informatif, à lire par un humain ou un futur réglage
+// manuel des seuils — jamais par le bot lui-même (aucun auto-ajustement de paramètres).
+// RISQUES ÉVITÉS : reste une fonction pure, sans effet de bord, appelée à la demande —
+// ne ralentit jamais la boucle principale (le calcul ne se fait que quand on consulte
+// les statistiques, pas à chaque rejet).
+function computeRejectedStats(rejected) {
+  if (!rejected || rejected.length === 0) {
+    return {
+      totalRejected: 0, mostCommonReason: null, avgRejectedEdge: 0,
+      theoreticalUnrealizedProfit: 0, byCategory: {}, byReasonType: {},
+    };
+  }
+  const reasonCounts = {};
+  const categoryCounts = {};
+  let edgeSum = 0, edgeCount = 0, theoreticalProfit = 0;
+  for (const r of rejected) {
+    // [v14-2] Regroupe par TYPE de refus plutôt que par message exact (qui contient des
+    // valeurs numériques variables, ex. "edge=-2.1%<3%") — sinon chaque refus serait
+    // considéré unique et la statistique "raison la plus fréquente" perdrait tout sens.
+    const reasonType = (r.reason ?? "INCONNU").split(/[=<(]/)[0].trim();
+    reasonCounts[reasonType] = (reasonCounts[reasonType] ?? 0) + 1;
+    const cat = r.category ?? "AUTRE";
+    categoryCounts[cat] = (categoryCounts[cat] ?? 0) + 1;
+    if (typeof r.edge === "number") { edgeSum += r.edge; edgeCount++; }
+    // Profit théorique non réalisé : uniquement pour les refus où l'edge était malgré
+    // tout positif (un vrai arbitrage existait mais a été écarté pour une autre raison,
+    // ex. score de marché trop bas) — un edge négatif ne représente aucun profit perdu.
+    if (typeof r.edge === "number" && r.edge > 0) theoreticalProfit += r.edge;
+  }
+  const mostCommonReason = Object.entries(reasonCounts).sort((a,b)=>b[1]-a[1])[0]?.[0] ?? null;
+  return {
+    totalRejected: rejected.length,
+    mostCommonReason,
+    avgRejectedEdge: edgeCount > 0 ? edgeSum / edgeCount : 0,
+    theoreticalUnrealizedProfit: theoreticalProfit,
+    byCategory: categoryCounts,
+    byReasonType: reasonCounts,
+  };
+}
+
 const DEFAULT_CFG = {
   minEdge: 0.03,      // [v11] seuil plus bas que l'ancien 8% : un arb mécanique de 3% net
                       // de frais est déjà un vrai profit garanti, pas besoin d'un edge énorme
@@ -334,6 +416,15 @@ const DEFAULT_CFG = {
   maxConsecutiveErrors: 5,   // [v12-9] arrêt auto après N échecs d'exécution consécutifs
   closedCheckEveryNTicks: 4, // [v12-11] vérifier la résolution moins souvent que le carnet (perf)
   maxBookLevels: 5,          // [v13-1] nombre max de niveaux de carnet analysés pour le VWAP/taille commune
+  // [v14-4] Optimisation des appels réseau — un marché à faible liquidité/volume et dont
+  // le coût combiné (OUI+NON) ne bouge pas depuis longtemps a très peu de chances d'avoir
+  // changé d'état entre deux cycles rapprochés. On espace ses vérifications de carnet
+  // SANS jamais l'ignorer définitivement — un rescan complet forcé revient périodiquement
+  // (staleRescanEveryNTicks) pour détecter un éventuel retour à une situation intéressante.
+  lowActivityLiquidityThreshold: 1000, // en dessous de ce seuil de liquidité déclarée...
+  lowActivityVolumeThreshold: 1000,    // ...ET de ce volume 24h, le marché est candidat au throttling
+  lowActivitySkipTicks: 3,             // nombre de cycles consécutifs sautés une fois "endormi"
+  staleRescanEveryNTicks: 20,          // forçage d'un rescan complet tous les N cycles, quoi qu'il arrive
 };
 
 module.exports = {
@@ -341,5 +432,6 @@ module.exports = {
   validateBookSanity, bookDepthUSDC, weightedFill, weightedFillByShares,
   levelsSharesAvailable, computeCommonArbitrableSize, computeArbitrableFill, estimateSlippage,
   detectMarketArb, sizeArb, calcArbProfit, scoreMarket, computeHoldStats,
+  rankOpportunity, computeRejectedStats,
   DEFAULT_CFG,
 };
