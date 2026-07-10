@@ -366,6 +366,79 @@ test('estimateSlippage: 0 si bestAsk est invalide (pas de division par zéro/né
   assert.equal(engine.estimateSlippage(-1, 0.5), 0);
 });
 
+// ─── [v14-1] rankOpportunity — classement des opportunités simultanées ──
+test('rankOpportunity: -Infinity pour un arb invalide (ne doit jamais être classé)', () => {
+  const m = makeMarket({ arb: { valid:false, reason:'EDGE_BAS' } });
+  assert.equal(engine.rankOpportunity(m), -Infinity);
+});
+test('rankOpportunity: un edge plus élevé produit un score plus élevé, toutes choses égales par ailleurs', () => {
+  const base = { sizeUSDC:100, liquidity:10000, volume24h:10000, score:70 };
+  const mBon  = makeMarket({ ...base, arb:{ valid:true, cost:0.85, edge:0.13, slippage:0.01 } });
+  const mFaible = makeMarket({ ...base, arb:{ valid:true, cost:0.97, edge:0.01, slippage:0.01 } });
+  assert.ok(engine.rankOpportunity(mBon) > engine.rankOpportunity(mFaible));
+});
+test('rankOpportunity: un slippage plus élevé pénalise le score, toutes choses égales par ailleurs', () => {
+  const base = { sizeUSDC:100, liquidity:10000, volume24h:10000, score:70, arb:{ valid:true, cost:0.85, edge:0.13 } };
+  const mPropre = makeMarket({ ...base, arb:{ ...base.arb, slippage:0.001 } });
+  const mGlissant = makeMarket({ ...base, arb:{ ...base.arb, slippage:0.20 } });
+  assert.ok(engine.rankOpportunity(mPropre) > engine.rankOpportunity(mGlissant));
+});
+test('rankOpportunity: trier un tableau à une seule opportunité valide ne change rien (comportement préservé)', () => {
+  const m = makeMarket({ arb:{ valid:true, cost:0.9, edge:0.05, slippage:0.01 } });
+  const arr = [m];
+  const sorted = [...arr].sort((a,b)=>engine.rankOpportunity(b)-engine.rankOpportunity(a));
+  assert.deepEqual(sorted, arr);
+});
+test('rankOpportunity: classe correctement plusieurs opportunités par ordre décroissant de qualité', () => {
+  const excellent = makeMarket({ id:'m1', sizeUSDC:500, liquidity:100000, volume24h:100000, score:90, arb:{ valid:true, cost:0.80, edge:0.18, slippage:0.005 } });
+  const mediocre  = makeMarket({ id:'m2', sizeUSDC:20,  liquidity:500,   volume24h:500,   score:35, arb:{ valid:true, cost:0.965, edge:0.015, slippage:0.03 } });
+  const sorted = [mediocre, excellent].sort((a,b)=>engine.rankOpportunity(b)-engine.rankOpportunity(a));
+  assert.equal(sorted[0].id, 'm1', 'la meilleure opportunité doit être classée en premier');
+});
+
+// ─── [v14-2] computeRejectedStats — agrégation du journal de rejets ────
+test('computeRejectedStats: valeurs neutres sur un journal vide', () => {
+  const s = engine.computeRejectedStats([]);
+  assert.equal(s.totalRejected, 0);
+  assert.equal(s.mostCommonReason, null);
+});
+test('computeRejectedStats: identifie correctement la raison la plus fréquente (regroupée par type, pas par message exact)', () => {
+  const rejected = [
+    { reason:'edge=-2.1%<3%', category:'SPORTS', edge:-0.021 },
+    { reason:'edge=-4.5%<3%', category:'POLITICS', edge:-0.045 },
+    { reason:'edge=-1.0%<3%', category:'SPORTS', edge:-0.01 },
+    { reason:'SCORE_BAS(24<30)', category:'AUTRE', edge:null },
+  ];
+  const s = engine.computeRejectedStats(rejected);
+  assert.equal(s.mostCommonReason, 'edge', 'les 3 messages "edge=...%<3%" doivent être regroupés sous le même type');
+  assert.equal(s.totalRejected, 4);
+});
+test('computeRejectedStats: calcule l\'edge moyen uniquement sur les entrées où il est connu', () => {
+  const rejected = [{ reason:'x', edge:-0.05 }, { reason:'y', edge:-0.03 }, { reason:'z', edge:null }];
+  const s = engine.computeRejectedStats(rejected);
+  assert.ok(Math.abs(s.avgRejectedEdge - (-0.04)) < 1e-9);
+});
+test('computeRejectedStats: le profit théorique non réalisé ne compte que les edges positifs refusés', () => {
+  const rejected = [
+    { reason:'SCORE_BAS', edge:0.05 },  // vrai arb refusé pour une autre raison → profit perdu
+    { reason:'edge_bas', edge:-0.02 },  // pas un vrai arb → ne compte pas comme profit perdu
+  ];
+  const s = engine.computeRejectedStats(rejected);
+  assert.ok(Math.abs(s.theoreticalUnrealizedProfit - 0.05) < 1e-9);
+});
+test('computeRejectedStats: répartition par catégorie correcte', () => {
+  const rejected = [{category:'SPORTS',reason:'a'},{category:'SPORTS',reason:'b'},{category:'POLITICS',reason:'c'}];
+  const s = engine.computeRejectedStats(rejected);
+  assert.equal(s.byCategory.SPORTS, 2);
+  assert.equal(s.byCategory.POLITICS, 1);
+});
+test('computeRejectedStats: n\'est jamais appelée automatiquement pour modifier des paramètres (vérification de contrat: pure fonction, aucun effet de bord)', () => {
+  const rejected = [{reason:'a',edge:0.01}];
+  const copy = JSON.parse(JSON.stringify(rejected));
+  engine.computeRejectedStats(rejected);
+  assert.deepEqual(rejected, copy, 'le tableau source ne doit jamais être modifié par cette fonction');
+});
+
 // ─── DEFAULT_CFG — garde-fous de sanité ─────────────────────────
 test('DEFAULT_CFG: valeurs de seuil raisonnables', () => {
   const c = engine.DEFAULT_CFG;
