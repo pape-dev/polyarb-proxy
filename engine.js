@@ -397,6 +397,130 @@ function computeRejectedStats(rejected) {
   };
 }
 
+// ─── [v15-5] STATISTIQUES DE PERFORMANCE AVANCÉES ─────────────────────────
+// PROBLÈME RÉSOLU : computeHoldStats (v12-6) donne la durée de détention et la
+// fréquence, mais aucune mesure de la QUALITÉ du couple risque/rendement. Ces cinq
+// métriques sont des standards du trading quantitatif, absentes jusqu'ici.
+// RISQUES ÉVITÉS : fonction pure, appelée uniquement à la demande (jamais dans la
+// boucle de décision) — ne peut donc jamais influencer un trade, conformément à la
+// consigne explicite "purement informatives".
+// CHOIX TECHNIQUE : réutilise positions.pnlUSDC déjà calculé (aucune redondance avec
+// closePosition), pas de nouvel état à maintenir — tout se déduit de bot.positions.
+function computeAdvancedStats(positions) {
+  const closed = (positions ?? []).filter(p => p.status === "CLOSED");
+  if (closed.length === 0) {
+    return { profitFactor:0, maxDrawdownPct:0, expectancy:0, recoveryFactor:0, calmarRatio:0 };
+  }
+  const grossProfit = closed.filter(p => (p.pnlUSDC??0) > 0).reduce((s,p)=>s+p.pnlUSDC, 0);
+  const grossLoss   = closed.filter(p => (p.pnlUSDC??0) < 0).reduce((s,p)=>s+Math.abs(p.pnlUSDC), 0);
+  // Profit Factor : gains totaux / pertes totales. Convention standard : Infinity si
+  // aucune perte (tous les trades sont gagnants) plutôt que division par zéro brute.
+  const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : (grossProfit > 0 ? Infinity : 0);
+
+  const totalPnl = closed.reduce((s,p)=>s+(p.pnlUSDC??0), 0);
+  // Expectancy : gain moyen attendu par trade (en $) — combine taux de réussite et
+  // ratio gain moyen/perte moyenne en une seule métrique de synthèse.
+  const expectancy = totalPnl / closed.length;
+
+  // Max Drawdown : reconstruit une courbe d'équity chronologique à partir des trades
+  // clôturés (triés par date de clôture), puis mesure la plus grande baisse relative
+  // depuis un sommet local — mesure standard de risque, indépendante du PnL total.
+  const sorted = [...closed].sort((a,b) => new Date(a.closedAt??a.ts) - new Date(b.closedAt??b.ts));
+  let equity = 0, peak = 0, maxDrawdown = 0;
+  for (const p of sorted) {
+    equity += (p.pnlUSDC ?? 0);
+    if (equity > peak) peak = equity;
+    const dd = peak > 0 ? (peak - equity) / peak : 0;
+    if (dd > maxDrawdown) maxDrawdown = dd;
+  }
+  // Recovery Factor : capacité du système à générer du profit net rapporté au pire
+  // creux traversé — un profit total élevé avec un faible drawdown donne un facteur élevé.
+  const recoveryFactor = maxDrawdown > 0 ? totalPnl / (maxDrawdown * Math.max(peak,1)) : (totalPnl > 0 ? Infinity : 0);
+
+  // Calmar Ratio : rendement annualisé rapporté au max drawdown — nécessite une durée
+  // réelle couverte par l'historique ; avec moins d'un jour de données, la métrique
+  // n'a pas de sens statistique (annualiser une heure de trading est trompeur), donc 0.
+  const spanDays = sorted.length >= 2
+    ? (new Date(sorted[sorted.length-1].closedAt??sorted[sorted.length-1].ts) - new Date(sorted[0].closedAt??sorted[0].ts)) / 86400000
+    : 0;
+  const annualizedReturn = spanDays >= 1 ? (totalPnl / spanDays) * 365 : 0;
+  const calmarRatio = (spanDays >= 1 && maxDrawdown > 0) ? annualizedReturn / (maxDrawdown * Math.max(peak,1)) : 0;
+
+  return { profitFactor, maxDrawdownPct: maxDrawdown, expectancy, recoveryFactor, calmarRatio };
+}
+
+// ─── [v15-9] STATISTIQUES HISTORIQUES (par période, par catégorie) ────────
+// PROBLÈME RÉSOLU : les métriques existantes (metrics, holdStats, computeAdvancedStats)
+// donnent une vue globale, mais aucune répartition dans le temps ni par catégorie de
+// marché — impossible de répondre à "ce mois-ci était-il meilleur que le précédent ?"
+// ou "les marchés SPORTS sont-ils plus rentables que POLITICS pour ce bot ?".
+// RISQUES ÉVITÉS : fonction pure, purement destinée au reporting (aucune décision de
+// trading n'en dépend) — conformément à la consigne explicite du point 9.
+// CHOIX TECHNIQUE : regroupe par clé de date (jour ISO / semaine ISO approx / mois) et
+// par catégorie en un seul passage sur les positions clôturées, réutilisant les mêmes
+// conventions que le reste du moteur (pnlUSDC déjà calculé, pas de redondance).
+function computeHistoricalBreakdown(positions) {
+  const closed = (positions ?? []).filter(p => p.status === "CLOSED" && p.closedAt);
+  const byDay = {}, byWeek = {}, byMonth = {}, byCategory = {};
+  const bump = (map, key, pnl) => {
+    if (!map[key]) map[key] = { pnl:0, trades:0, wins:0 };
+    map[key].pnl += pnl;
+    map[key].trades += 1;
+    if (pnl > 0) map[key].wins += 1;
+  };
+  for (const p of closed) {
+    const d = new Date(p.closedAt);
+    const dayKey = d.toISOString().slice(0,10);
+    // Semaine ISO approximative (suffisante pour du reporting, pas besoin de la norme
+    // ISO-8601 stricte avec ses années à cheval) : année + numéro de semaine depuis le 1er janvier.
+    const startOfYear = new Date(Date.UTC(d.getUTCFullYear(),0,1));
+    const weekNum = Math.ceil((((d - startOfYear) / 86400000) + startOfYear.getUTCDay() + 1) / 7);
+    const weekKey = `${d.getUTCFullYear()}-W${String(weekNum).padStart(2,'0')}`;
+    const monthKey = d.toISOString().slice(0,7);
+    const pnl = p.pnlUSDC ?? 0;
+    bump(byDay, dayKey, pnl);
+    bump(byWeek, weekKey, pnl);
+    bump(byMonth, monthKey, pnl);
+    bump(byCategory, p.category ?? "AUTRE", pnl);
+  }
+  return { byDay, byWeek, byMonth, byCategory };
+}
+
+// ─── [v15-10] SIMULATION RÉALISTE DU MODE PAPER ────────────────────────────
+// PROBLÈME RÉSOLU : le mode paper créditait jusqu'ici un trade parfait, instantané,
+// toujours rempli à 100% au prix exact vu au dernier scan — bien plus optimiste que
+// l'exécution réelle (latence réseau, glissement additionnel, remplissages partiels,
+// ordres parfois rejetés ou en échec technique). Un historique "paper" ainsi gonflé
+// donnerait une fausse confiance avant de risquer de l'argent réel.
+// RISQUES ÉVITÉS : cette fonction n'est appelée QUE sur le chemin PAPER (voir index.js,
+// executeOrder) — le mode LIVE, déjà validé et déjà réaliste (il interroge le vrai
+// carnet juste avant d'exécuter), n'est JAMAIS concerné, conformément à la consigne
+// explicite de ne pas modifier son comportement.
+// CHOIX TECHNIQUE : RNG injectable (paramètre optionnel, défaut Math.random) — permet
+// des tests déterministes avec une seed fixe sans changer le comportement réel, qui
+// continue d'utiliser le générateur aléatoire standard.
+function simulatePaperExecution(arb, cfg, rng = Math.random) {
+  const failureRate      = cfg.paperFailureRate ?? 0.02;      // échec technique (ex. coupure réseau simulée)
+  const rejectRate       = cfg.paperRejectRate ?? 0.03;       // ordre rejeté par la plateforme (simulé)
+  const partialFillRate  = cfg.paperPartialFillRate ?? 0.10;  // remplissage partiel plutôt que complet
+  const extraSlippageMax = cfg.paperExtraSlippageMax ?? 0.01; // glissement additionnel max (au-delà du VWAP déjà calculé)
+  const latencyMinMs     = cfg.paperLatencyMinMs ?? 100;
+  const latencyMaxMs     = cfg.paperLatencyMaxMs ?? 1500;
+
+  const delayMs = Math.round(latencyMinMs + rng() * (latencyMaxMs - latencyMinMs));
+  const roll = rng();
+
+  if (roll < failureRate) return { outcome:'failed', filledFraction:0, effectiveCost:null, delayMs };
+  if (roll < failureRate + rejectRate) return { outcome:'rejected', filledFraction:0, effectiveCost:null, delayMs };
+
+  let filledFraction = 1;
+  if (roll < failureRate + rejectRate + partialFillRate) filledFraction = 0.2 + rng()*0.7; // rempli entre 20% et 90%
+
+  const extraSlippage = rng() * extraSlippageMax;
+  const effectiveCost = clamp(arb.cost + extraSlippage, 0.001, 0.999);
+  return { outcome: filledFraction < 1 ? 'partial' : 'filled', filledFraction, effectiveCost, delayMs };
+}
+
 const DEFAULT_CFG = {
   minEdge: 0.03,      // [v11] seuil plus bas que l'ancien 8% : un arb mécanique de 3% net
                       // de frais est déjà un vrai profit garanti, pas besoin d'un edge énorme
@@ -425,6 +549,22 @@ const DEFAULT_CFG = {
   lowActivityVolumeThreshold: 1000,    // ...ET de ce volume 24h, le marché est candidat au throttling
   lowActivitySkipTicks: 3,             // nombre de cycles consécutifs sautés une fois "endormi"
   staleRescanEveryNTicks: 20,          // forçage d'un rescan complet tous les N cycles, quoi qu'il arrive
+  // [v15-1] Circuit breaker par API externe (Gamma / CLOB)
+  circuitBreakerThreshold: 5,     // erreurs consécutives avant ouverture du circuit
+  circuitBreakerCooldownMs: 60000, // durée de suspension avant nouvelle tentative
+  // [v15-3] Watchdog du moteur principal
+  watchdogMaxSilenceMs: 120000,   // délai sans tick complété avant alerte (8x refreshMs par défaut)
+  // [v15-2] Validation périodique des positions live
+  positionValidationEveryNTicks: 20, // ~toutes les 5 min avec un cycle de 15s
+  // [v15-6] Journalisation persistante PostgreSQL
+  logRetentionDays: 14,           // nettoyage automatique des logs en base au-delà de ce délai
+  // [v15-10] Simulation réaliste du mode PAPER (jamais appliqué en LIVE)
+  paperFailureRate: 0.02,
+  paperRejectRate: 0.03,
+  paperPartialFillRate: 0.10,
+  paperExtraSlippageMax: 0.01,
+  paperLatencyMinMs: 100,
+  paperLatencyMaxMs: 1500,
 };
 
 module.exports = {
@@ -432,6 +572,7 @@ module.exports = {
   validateBookSanity, bookDepthUSDC, weightedFill, weightedFillByShares,
   levelsSharesAvailable, computeCommonArbitrableSize, computeArbitrableFill, estimateSlippage,
   detectMarketArb, sizeArb, calcArbProfit, scoreMarket, computeHoldStats,
-  rankOpportunity, computeRejectedStats,
+  rankOpportunity, computeRejectedStats, computeAdvancedStats, computeHistoricalBreakdown,
+  simulatePaperExecution,
   DEFAULT_CFG,
 };
