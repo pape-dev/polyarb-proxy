@@ -439,6 +439,167 @@ test('computeRejectedStats: n\'est jamais appelée automatiquement pour modifier
   assert.deepEqual(rejected, copy, 'le tableau source ne doit jamais être modifié par cette fonction');
 });
 
+// ─── [v15-5] computeAdvancedStats — métriques de performance avancées ──
+test('computeAdvancedStats: valeurs neutres sans aucune position clôturée', () => {
+  const s = engine.computeAdvancedStats([]);
+  assert.equal(s.profitFactor, 0);
+  assert.equal(s.maxDrawdownPct, 0);
+  assert.equal(s.expectancy, 0);
+});
+test('computeAdvancedStats: profitFactor = Infinity si aucune perte', () => {
+  const positions = [
+    { status:'CLOSED', pnlUSDC:10, ts:'2026-01-01T00:00:00Z', closedAt:'2026-01-01T01:00:00Z' },
+    { status:'CLOSED', pnlUSDC:5,  ts:'2026-01-01T02:00:00Z', closedAt:'2026-01-01T03:00:00Z' },
+  ];
+  assert.equal(engine.computeAdvancedStats(positions).profitFactor, Infinity);
+});
+test('computeAdvancedStats: profitFactor cohérent avec gains/pertes bruts', () => {
+  const positions = [
+    { status:'CLOSED', pnlUSDC:20, ts:'2026-01-01T00:00:00Z', closedAt:'2026-01-01T01:00:00Z' },
+    { status:'CLOSED', pnlUSDC:-10, ts:'2026-01-01T02:00:00Z', closedAt:'2026-01-01T03:00:00Z' },
+  ];
+  assert.ok(Math.abs(engine.computeAdvancedStats(positions).profitFactor - 2) < 1e-9);
+});
+test('computeAdvancedStats: expectancy = PnL total / nombre de trades', () => {
+  const positions = [
+    { status:'CLOSED', pnlUSDC:30, ts:'2026-01-01T00:00:00Z', closedAt:'2026-01-01T01:00:00Z' },
+    { status:'CLOSED', pnlUSDC:-10, ts:'2026-01-01T02:00:00Z', closedAt:'2026-01-01T03:00:00Z' },
+  ];
+  assert.ok(Math.abs(engine.computeAdvancedStats(positions).expectancy - 10) < 1e-9);
+});
+test('computeAdvancedStats: maxDrawdownPct détecte une vraie baisse depuis un sommet', () => {
+  const positions = [
+    { status:'CLOSED', pnlUSDC:100, ts:'2026-01-01T00:00:00Z', closedAt:'2026-01-01T01:00:00Z' }, // equity: 100 (pic)
+    { status:'CLOSED', pnlUSDC:-40, ts:'2026-01-01T02:00:00Z', closedAt:'2026-01-01T03:00:00Z' }, // equity: 60 → dd 40%
+    { status:'CLOSED', pnlUSDC:10,  ts:'2026-01-01T04:00:00Z', closedAt:'2026-01-01T05:00:00Z' }, // equity: 70
+  ];
+  const s = engine.computeAdvancedStats(positions);
+  assert.ok(Math.abs(s.maxDrawdownPct - 0.4) < 1e-9, `drawdown attendu 40%, reçu ${s.maxDrawdownPct*100}%`);
+});
+test('computeAdvancedStats: ignore les positions encore ouvertes', () => {
+  const positions = [{ status:'OPEN', pnlUSDC:0, ts:'2026-01-01T00:00:00Z' }];
+  const s = engine.computeAdvancedStats(positions);
+  assert.equal(s.expectancy, 0);
+});
+test('computeAdvancedStats: calmarRatio reste 0 si l\'historique couvre moins d\'une journée (pas d\'annualisation trompeuse)', () => {
+  const positions = [
+    { status:'CLOSED', pnlUSDC:10, ts:'2026-01-01T00:00:00Z', closedAt:'2026-01-01T00:10:00Z' },
+    { status:'CLOSED', pnlUSDC:-5, ts:'2026-01-01T00:20:00Z', closedAt:'2026-01-01T00:30:00Z' },
+  ];
+  assert.equal(engine.computeAdvancedStats(positions).calmarRatio, 0);
+});
+test('computeAdvancedStats: n\'a aucun effet de bord sur le tableau source', () => {
+  const positions = [{ status:'CLOSED', pnlUSDC:5, ts:'2026-01-01T00:00:00Z', closedAt:'2026-01-01T01:00:00Z' }];
+  const copy = JSON.parse(JSON.stringify(positions));
+  engine.computeAdvancedStats(positions);
+  assert.deepEqual(positions, copy);
+});
+
+// ─── [v15-9] computeHistoricalBreakdown — agrégation par période/catégorie ──
+test('computeHistoricalBreakdown: structures vides sans aucune position clôturée', () => {
+  const b = engine.computeHistoricalBreakdown([]);
+  assert.deepEqual(b.byDay, {});
+  assert.deepEqual(b.byCategory, {});
+});
+test('computeHistoricalBreakdown: agrège correctement plusieurs trades le même jour', () => {
+  const positions = [
+    { status:'CLOSED', closedAt:'2026-01-15T10:00:00Z', pnlUSDC:10, category:'SPORTS' },
+    { status:'CLOSED', closedAt:'2026-01-15T18:00:00Z', pnlUSDC:-4, category:'SPORTS' },
+  ];
+  const b = engine.computeHistoricalBreakdown(positions);
+  assert.equal(b.byDay['2026-01-15'].trades, 2);
+  assert.ok(Math.abs(b.byDay['2026-01-15'].pnl - 6) < 1e-9);
+  assert.equal(b.byDay['2026-01-15'].wins, 1);
+});
+test('computeHistoricalBreakdown: sépare correctement deux jours différents', () => {
+  const positions = [
+    { status:'CLOSED', closedAt:'2026-01-15T10:00:00Z', pnlUSDC:10, category:'SPORTS' },
+    { status:'CLOSED', closedAt:'2026-01-16T10:00:00Z', pnlUSDC:5, category:'SPORTS' },
+  ];
+  const b = engine.computeHistoricalBreakdown(positions);
+  assert.equal(Object.keys(b.byDay).length, 2);
+});
+test('computeHistoricalBreakdown: regroupe correctement par catégorie', () => {
+  const positions = [
+    { status:'CLOSED', closedAt:'2026-01-15T10:00:00Z', pnlUSDC:10, category:'SPORTS' },
+    { status:'CLOSED', closedAt:'2026-01-15T10:00:00Z', pnlUSDC:-3, category:'POLITICS' },
+  ];
+  const b = engine.computeHistoricalBreakdown(positions);
+  assert.ok(Math.abs(b.byCategory.SPORTS.pnl - 10) < 1e-9);
+  assert.ok(Math.abs(b.byCategory.POLITICS.pnl - (-3)) < 1e-9);
+});
+test('computeHistoricalBreakdown: catégorie absente regroupée sous AUTRE', () => {
+  const positions = [{ status:'CLOSED', closedAt:'2026-01-15T10:00:00Z', pnlUSDC:1 }];
+  const b = engine.computeHistoricalBreakdown(positions);
+  assert.equal(b.byCategory.AUTRE.trades, 1);
+});
+test('computeHistoricalBreakdown: ignore les positions ouvertes ou sans date de clôture', () => {
+  const positions = [
+    { status:'OPEN', pnlUSDC:100, category:'SPORTS' },
+    { status:'CLOSED', pnlUSDC:5, category:'SPORTS' }, // sans closedAt
+  ];
+  const b = engine.computeHistoricalBreakdown(positions);
+  assert.deepEqual(b.byCategory, {});
+});
+test('computeHistoricalBreakdown: regroupe correctement par mois', () => {
+  const positions = [
+    { status:'CLOSED', closedAt:'2026-01-15T10:00:00Z', pnlUSDC:10, category:'SPORTS' },
+    { status:'CLOSED', closedAt:'2026-02-01T10:00:00Z', pnlUSDC:5, category:'SPORTS' },
+  ];
+  const b = engine.computeHistoricalBreakdown(positions);
+  assert.equal(b.byMonth['2026-01'].trades, 1);
+  assert.equal(b.byMonth['2026-02'].trades, 1);
+});
+
+// ─── [v15-10] simulatePaperExecution — réalisme du mode paper ──────────
+test('simulatePaperExecution: échec technique si le tirage tombe sous failureRate', () => {
+  const cfg = { paperFailureRate:0.5, paperRejectRate:0, paperPartialFillRate:0 };
+  const r = engine.simulatePaperExecution({cost:0.9}, cfg, () => 0.1); // 0.1 < 0.5
+  assert.equal(r.outcome, 'failed');
+  assert.equal(r.filledFraction, 0);
+});
+test('simulatePaperExecution: rejet si le tirage tombe entre failureRate et failureRate+rejectRate', () => {
+  const cfg = { paperFailureRate:0.1, paperRejectRate:0.5, paperPartialFillRate:0 };
+  const r = engine.simulatePaperExecution({cost:0.9}, cfg, () => 0.3); // entre 0.1 et 0.6
+  assert.equal(r.outcome, 'rejected');
+});
+test('simulatePaperExecution: remplissage complet si le tirage dépasse tous les taux d\'incident', () => {
+  const cfg = { paperFailureRate:0.02, paperRejectRate:0.03, paperPartialFillRate:0.10, paperExtraSlippageMax:0.01 };
+  const r = engine.simulatePaperExecution({cost:0.9}, cfg, () => 0.99); // au-delà de tous les seuils
+  assert.equal(r.outcome, 'filled');
+  assert.equal(r.filledFraction, 1);
+});
+test('simulatePaperExecution: remplissage partiel dans la bonne tranche de probabilité', () => {
+  const cfg = { paperFailureRate:0.02, paperRejectRate:0.03, paperPartialFillRate:0.10, paperExtraSlippageMax:0.01 };
+  const r = engine.simulatePaperExecution({cost:0.9}, cfg, () => 0.10); // dans la tranche partial (0.05-0.15)
+  assert.equal(r.outcome, 'partial');
+  assert.ok(r.filledFraction > 0 && r.filledFraction < 1);
+});
+test('simulatePaperExecution: le coût effectif inclut toujours un glissement additionnel ≥ 0', () => {
+  const cfg = { paperFailureRate:0, paperRejectRate:0, paperPartialFillRate:0, paperExtraSlippageMax:0.02 };
+  const r = engine.simulatePaperExecution({cost:0.80}, cfg, () => 0.9);
+  assert.ok(r.effectiveCost >= 0.80, 'le glissement simulé ne doit jamais AMÉLIORER le prix par rapport au VWAP déjà calculé');
+});
+test('simulatePaperExecution: coût effectif null si rejeté ou en échec (aucun remplissage réel)', () => {
+  const cfg = { paperFailureRate:1, paperRejectRate:0, paperPartialFillRate:0 };
+  const r = engine.simulatePaperExecution({cost:0.9}, cfg, () => 0);
+  assert.equal(r.effectiveCost, null);
+});
+test('simulatePaperExecution: delayMs toujours dans la fourchette configurée', () => {
+  const cfg = { paperLatencyMinMs:200, paperLatencyMaxMs:400, paperFailureRate:0, paperRejectRate:0, paperPartialFillRate:0 };
+  for (const seed of [0, 0.25, 0.5, 0.75, 0.99]) {
+    const r = engine.simulatePaperExecution({cost:0.9}, cfg, () => seed);
+    assert.ok(r.delayMs >= 200 && r.delayMs <= 400, `delay ${r.delayMs} hors de [200,400]`);
+  }
+});
+test('simulatePaperExecution: reproductible avec la même seed (déterminisme du RNG injecté)', () => {
+  const cfg = engine.DEFAULT_CFG;
+  const rng = () => 0.42;
+  const r1 = engine.simulatePaperExecution({cost:0.85}, cfg, rng);
+  const r2 = engine.simulatePaperExecution({cost:0.85}, cfg, rng);
+  assert.deepEqual(r1, r2);
+});
+
 // ─── DEFAULT_CFG — garde-fous de sanité ─────────────────────────
 test('DEFAULT_CFG: valeurs de seuil raisonnables', () => {
   const c = engine.DEFAULT_CFG;
