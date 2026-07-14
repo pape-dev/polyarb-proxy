@@ -11,6 +11,27 @@ const pool = new Pool({
     : { rejectUnauthorized: false }
 });
 
+// ─── [v15-7] CONTRÔLE D'INTÉGRITÉ POSTGRESQL ───────────────────────────────
+// PROBLÈME RÉSOLU : jusqu'ici, une perte de connexion DB n'était visible qu'indirectement
+// (le message générique "[BOT] Erreur persistance: ..." dans les logs bruts), sans état
+// consultable ni alerte. Impossible de savoir d'un coup d'œil si la persistance
+// fonctionne réellement en ce moment.
+// CHOIX TECHNIQUE : `pool.on('error', ...)` est l'API standard du driver `pg` pour
+// détecter la perte d'un client inactif dans le pool — écouter cet événement ne modifie
+// AUCUN appel pool.query() existant (zéro risque de régression sur le code déjà validé).
+// Le suivi des succès/échecs d'écriture spécifiques est ajouté séparément, de façon
+// additive, à l'intérieur des try/catch déjà présents dans persistBotState/loadBotState
+// (mêmes lignes, mêmes comportements, juste une ligne de plus pour mettre à jour dbHealth).
+const dbHealth = { connected: true, lastError: null, lastErrorAt: null, totalErrors: 0, lastSuccessfulWriteAt: null, lastSuccessfulReadAt: null };
+pool.on('error', (err) => {
+  dbHealth.connected = false;
+  dbHealth.lastError = err.message;
+  dbHealth.lastErrorAt = new Date().toISOString();
+  dbHealth.totalErrors++;
+  botLog("RISK", `⛔ PostgreSQL : erreur de connexion détectée — ${err.message}`);
+  triggerAlert('db_connection_lost', { error: err.message }).catch(()=>{});
+});
+
 // ─── Client CLOB signé (ordres réels) ────────────────────
 let clobClient = null;
 async function getClobClient() {
@@ -86,10 +107,103 @@ function computeApiHealth() {
   return out;
 }
 
+// ─── [v15-8] SYSTÈME D'ALERTES EXTENSIBLE ──────────────────────────────────
+// PROBLÈME RÉSOLU : les événements critiques (pause automatique, circuit breaker,
+// perte DB, erreurs répétées) n'étaient visibles que dans les logs — il fallait
+// activement consulter l'app pour les remarquer. Ce système garde une trace interne
+// ET peut pousser vers un canal externe (Telegram, Discord, email...) SANS que le
+// reste du moteur n'ait besoin de savoir comment ce canal fonctionne.
+// CHOIX TECHNIQUE : un tableau de callbacks (`alertChannels`) plutôt qu'une intégration
+// figée à un seul service — ajouter un canal ne demande qu'un `registerAlertChannel(fn)`,
+// aucune modification du code qui déclenche les alertes. Par défaut, AUCUN canal externe
+// n'est configuré (rien n'est envoyé nulle part) ; si la variable d'env ALERT_WEBHOOK_URL
+// est présente, un canal webhook générique (POST JSON) est enregistré automatiquement —
+// compatible out-of-the-box avec la plupart des services (Discord/Slack/Zapier acceptent
+// un POST JSON simple), sans dépendance supplémentaire à installer.
+// RISQUES ÉVITÉS : chaque canal est appelé dans son propre try/catch — un webhook qui
+// timeout ou renvoie une erreur ne doit JAMAIS faire planter le moteur ni bloquer une
+// décision de trading (les alertes sont toujours déclenchées en fire-and-forget).
+const alertChannels = [];
+function registerAlertChannel(fn) { alertChannels.push(fn); }
+async function triggerAlert(type, details) {
+  const alert = { type, details, ts: new Date().toISOString() };
+  bot.alerts.push(alert);
+  if (bot.alerts.length > 100) bot.alerts = bot.alerts.slice(-100); // borné, pas de fuite mémoire
+  for (const channel of alertChannels) {
+    try { await channel(alert); } catch(e) { console.error('[ALERT] canal en échec:', e.message); }
+  }
+}
+if (process.env.ALERT_WEBHOOK_URL) {
+  registerAlertChannel(async (alert) => {
+    await fetch(process.env.ALERT_WEBHOOK_URL, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: `🔔 POLYARB [${alert.type}] ${JSON.stringify(alert.details)}` }),
+    });
+  });
+}
+
+// ─── [v15-1] CIRCUIT BREAKER PAR API EXTERNE (Gamma / CLOB) ────────────────
+// PROBLÈME RÉSOLU : jusqu'ici, le bot continuait d'interroger Gamma/CLOB même après
+// une longue série d'échecs consécutifs — chaque appel retente, timeout après 12s
+// (fetchExternal), échoue à nouveau. En cas de panne prolongée d'une API, ça gaspille
+// du temps et des ressources sans aucun bénéfice (aucune chance de succès tant que
+// l'API est réellement en panne).
+// RISQUES ÉVITÉS : sans ce filet, une panne CLOB de plusieurs minutes ferait quand
+// même tenter ~4 appels/marché toutes les 15s pendant toute la durée de la panne —
+// avec le circuit ouvert, on arrête d'essayer pendant circuitBreakerCooldownMs et on
+// laisse les fallbacks existants (book simulé, closed:false) faire leur travail habituel.
+// IMPORTANT : ce mécanisme ne fait QUE bloquer des appels réseau — il ne modifie jamais
+// une décision de trading. Un circuit ouvert produit exactement le même résultat qu'un
+// échec réseau ordinaire (déjà géré partout par les try/catch existants), juste sans
+// solliciter l'API pendant le cooldown.
+const circuitBreakers = {
+  gamma: { state: 'closed', consecutiveErrors: 0, openedAt: null },
+  clob:  { state: 'closed', consecutiveErrors: 0, openedAt: null },
+  other: { state: 'closed', consecutiveErrors: 0, openedAt: null },
+};
+function isCircuitOpen(api) {
+  const cb = circuitBreakers[api] ?? circuitBreakers.other;
+  if (cb.state !== 'open') return false;
+  const elapsed = Date.now() - cb.openedAt;
+  if (elapsed >= (bot.cfg.circuitBreakerCooldownMs ?? 60000)) {
+    // Délai de suspension écoulé → on autorise UNE tentative de sonde (half-open),
+    // sans encore déclarer le circuit refermé tant qu'elle n'a pas réussi.
+    cb.state = 'half-open';
+    return false;
+  }
+  return true;
+}
+function recordCircuitResult(api, ok) {
+  const cb = circuitBreakers[api] ?? circuitBreakers.other;
+  if (ok) {
+    if (cb.state !== 'closed') botLog("SYS", `⚡ Circuit breaker [${api}] refermé — API de nouveau opérationnelle`);
+    cb.state = 'closed';
+    cb.consecutiveErrors = 0;
+    cb.openedAt = null;
+  } else {
+    cb.consecutiveErrors++;
+    const threshold = bot.cfg.circuitBreakerThreshold ?? 5;
+    if (cb.state === 'half-open' || cb.consecutiveErrors >= threshold) {
+      if (cb.state !== 'open') {
+        const cooldownS = Math.round((bot.cfg.circuitBreakerCooldownMs ?? 60000)/1000);
+        botLog("RISK", `⛔ Circuit breaker [${api}] OUVERT après ${cb.consecutiveErrors} erreurs consécutives — appels suspendus ${cooldownS}s`);
+        triggerAlert('circuit_breaker_open', { api, consecutiveErrors: cb.consecutiveErrors }).catch(()=>{});
+      }
+      cb.state = 'open';
+      cb.openedAt = Date.now();
+    }
+  }
+}
+
 async function fetchExternal(url, opts = {}, timeoutMs = 12000) {
+  const apiName = classifyApi(url);         // [v14-3]
+  // [v15-1] Circuit ouvert → on échoue immédiatement SANS solliciter le réseau, exactement
+  // comme un échec réseau ordinaire (mêmes fallbacks en aval, aucune décision différente).
+  if (isCircuitOpen(apiName)) {
+    throw new Error(`Circuit breaker ouvert pour ${apiName} — appel bloqué`);
+  }
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
-  const apiName = classifyApi(url);         // [v14-3]
   const startedAt = Date.now();             // [v14-3]
   try {
     const r = await fetch(url, {
@@ -106,16 +220,21 @@ async function fetchExternal(url, opts = {}, timeoutMs = 12000) {
       const body = await r.text().catch(() => "");
       console.error(`[EXT] ${url} → HTTP ${r.status} — ${body.slice(0, 200)}`);
       recordApiCall(apiName, Date.now()-startedAt, false, `HTTP ${r.status}`); // [v14-3]
+      recordCircuitResult(apiName, false); // [v15-1]
       throw new Error(`HTTP ${r.status}`);
     }
     recordApiCall(apiName, Date.now()-startedAt, true, null); // [v14-3]
+    recordCircuitResult(apiName, true); // [v15-1]
     return r;
   } catch (e) {
     clearTimeout(t);
     console.error(`[EXT] ${url} → ÉCHEC: ${e.message}`);
     // [v14-3] Si l'erreur vient du throw HTTP ci-dessus, l'appel est déjà comptabilisé —
     // on ne le recompte pas une deuxième fois (sinon un seul échec compterait double).
-    if (!e.message.startsWith('HTTP ')) recordApiCall(apiName, Date.now()-startedAt, false, e.message);
+    if (!e.message.startsWith('HTTP ') && !e.message.startsWith('Circuit breaker')) {
+      recordApiCall(apiName, Date.now()-startedAt, false, e.message);
+      recordCircuitResult(apiName, false); // [v15-1]
+    }
     throw e;
   }
 }
@@ -124,6 +243,22 @@ async function initDB() {
   try {
     await pool.query(`CREATE TABLE IF NOT EXISTS cfg (key TEXT PRIMARY KEY, value TEXT)`);
     await pool.query(`CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ DEFAULT now())`);
+    // [v15-6] Table dédiée à la journalisation persistante — les logs en mémoire
+    // (bot.logs, 400 entrées max) restent inchangés et continuent d'alimenter /bot-state
+    // comme avant ; cette table est un historique DURABLE en parallèle, qui survit aux
+    // redémarrages. Index sur created_at pour que le nettoyage (DELETE WHERE created_at <
+    // ...) et la consultation triée restent rapides même avec beaucoup de lignes.
+    await pool.query(`CREATE TABLE IF NOT EXISTS logs (
+      id SERIAL PRIMARY KEY, kind TEXT, msg TEXT, created_at TIMESTAMPTZ DEFAULT now()
+    )`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs (created_at)`);
+    // [v15-9] Snapshots quotidiens du bankroll — nécessaires pour "l'évolution du
+    // bankroll dans le temps" : bot.positions seul ne suffit pas (capé à 200 entrées
+    // persistées, et un jour sans aucun trade ne laisserait aucune trace du bankroll
+    // à ce moment-là). ON CONFLICT permet un appel idempotent (rejouable sans dupliquer).
+    await pool.query(`CREATE TABLE IF NOT EXISTS daily_snapshots (
+      date DATE PRIMARY KEY, bankroll NUMERIC, created_at TIMESTAMPTZ DEFAULT now()
+    )`);
     console.log('[DB] PostgreSQL connecté ✅');
   } catch(e) {
     console.error('[DB] Erreur connexion:', e.message);
@@ -166,6 +301,9 @@ const bot = {
   paused: false, pausedReason: null,      // [v12-9] kill-switch perte journalière/hebdo
   week: { start: new Date().toISOString().slice(0,10), startBr: engine.DEFAULT_CFG.bankroll },
   rejected: [],                          // [v12-8] opportunités refusées (apprentissage passif)
+  alerts: [],                            // [v15-8] historique des alertes déclenchées (borné à 100)
+  startedAt: Date.now(),                 // [v15-3] pour le watchdog avant le tout premier tick
+  lastTickCompletedAt: null,             // [v15-3] mis à jour à la fin de chaque cycle réussi
   eventCounters: {},                     // [v14-5] compteur par type d'événement (kind) depuis le démarrage
   lastSummaryAt: Date.now(),             // [v14-5] pour espacer les résumés périodiques
 };
@@ -177,10 +315,21 @@ const bot = {
 // répond à ce besoin sans surcoût perceptible (un `++` sur un objet en mémoire).
 const SUMMARY_INTERVAL_MS = 30 * 60 * 1000; // résumé périodique toutes les 30 min
 
+// [v15-6] Écriture fire-and-forget vers la table `logs` persistante — botLog() reste
+// une fonction SYNCHRONE comme avant (aucun appelant existant ne doit être changé en
+// async), donc cette écriture DB part en arrière-plan sans jamais être attendue ici.
+// Un échec d'écriture (DB indisponible) est capturé par son propre .catch() et ne
+// remonte JAMAIS à l'appelant de botLog — la persistance des logs est un bonus, pas
+// une dépendance critique du fonctionnement du moteur.
+function persistLogAsync(kind, msg) {
+  pool.query('INSERT INTO logs (kind, msg) VALUES ($1,$2)', [kind, msg]).catch(()=>{});
+}
+
 function botLog(kind, msg) {
   const ts = new Date().toISOString().slice(11,22);
   bot.logs.push({ ts, kind, msg, id: Date.now()+Math.random() });
   console.log(`[BOT ${kind}] ${msg}`);
+  persistLogAsync(kind, msg); // [v15-6]
   // [v14-5] Compteur par type — jamais réinitialisé automatiquement (compteur de vie du
   // process), remis à zéro seulement par un redémarrage du serveur.
   bot.eventCounters[kind] = (bot.eventCounters[kind] ?? 0) + 1;
@@ -193,6 +342,7 @@ function botLog(kind, msg) {
     const summary = `Résumé 30min — SIG:${c.SIG??0} ORDER:${c.ORDER??0} CLOSE:${c.CLOSE??0} SETTLE:${c.SETTLE??0} RISK:${c.RISK??0} WARN:${c.WARN??0} ERR:${c.ERR??0} | bankroll=$${bot.bankroll.toFixed(2)} | ${bot.markets.length} marchés suivis | ${bot.positions.filter(p=>p.status==="OPEN").length} positions ouvertes`;
     bot.logs.push({ ts: new Date().toISOString().slice(11,22), kind:"SYS", msg:summary, id: Date.now()+Math.random() });
     console.log(`[BOT SYS] ${summary}`);
+    persistLogAsync("SYS", summary); // [v15-6]
   }
   // [FIX] Retronqué APRÈS l'ajout éventuel du résumé ci-dessus, sinon ce dernier pourrait
   // pousser le journal à 402 entrées sans jamais être ramené à la limite de 400.
@@ -202,6 +352,7 @@ function botLog(kind, msg) {
 async function loadBotState() {
   try {
     const r = await pool.query('SELECT key, value FROM state');
+    dbHealth.connected = true; dbHealth.lastSuccessfulReadAt = new Date().toISOString(); // [v15-7]
     const s = {};
     r.rows.forEach(row => s[row.key] = row.value);
     if (s.pa6_pos) bot.positions = JSON.parse(s.pa6_pos);
@@ -236,6 +387,9 @@ async function loadBotState() {
     if (s.pa6_rejected) bot.rejected = JSON.parse(s.pa6_rejected);
     botLog("SYS", "État restauré depuis Postgres — moteur v11 (arbitrage mécanique)");
   } catch(e) {
+    // [v15-7] Le message et le comportement de repli ("Démarrage frais") restent
+    // identiques — on ajoute seulement le suivi de santé DB en parallèle.
+    dbHealth.connected = false; dbHealth.lastError = e.message; dbHealth.lastErrorAt = new Date().toISOString(); dbHealth.totalErrors++;
     botLog("SYS", "Démarrage frais — moteur v11");
   }
   bot.loaded = true;
@@ -262,8 +416,17 @@ async function persistBotState() {
         [key, value]
       );
     }
+    dbHealth.connected = true; dbHealth.lastSuccessfulWriteAt = new Date().toISOString(); // [v15-7]
   } catch(e) {
     console.error('[BOT] Erreur persistance:', e.message);
+    // [v15-7] Suivi additif — le comportement existant (log + continuer sans crasher)
+    // reste strictement identique, on ajoute seulement l'état consultable via /bot-state.
+    dbHealth.connected = false; dbHealth.lastError = e.message; dbHealth.lastErrorAt = new Date().toISOString(); dbHealth.totalErrors++;
+    if (dbHealth.totalErrors === 1 || dbHealth.totalErrors % 10 === 0) {
+      // [v15-8] Alerte seulement à la première occurrence puis toutes les 10 — évite
+      // de spammer le canal d'alerte si la DB reste indisponible pendant longtemps.
+      triggerAlert('db_write_failed', { error: e.message, totalErrors: dbHealth.totalErrors }).catch(()=>{});
+    }
   }
 }
 
@@ -495,6 +658,7 @@ async function executeOrder(marketId) {
   }
 
   let mode = "PAPER";
+  let orderIdYes = null, orderIdNo = null; // [v15-2/4] nécessaires à la validation périodique et à la réconciliation au redémarrage
   // [FIX] arbUsed reflète maintenant la forme v12 (roundedShares, realCostUSDC, cost=VWAP)
   let arbUsed = m.arb;
   const client = await getClobClient();
@@ -521,6 +685,13 @@ async function executeOrder(marketId) {
     if (yesOk && noOk) {
       mode = "LIVE";
       bot.consecutiveErrors = 0;
+      // [v15-2/4] Capture des IDs d'ordres — jusqu'ici jamais conservés, rendant
+      // impossible toute vérification ultérieure ("cet ordre existe-t-il encore
+      // réellement sur Polymarket ?") ou réconciliation après un redémarrage. Plusieurs
+      // noms de champ tentés par prudence : la forme exacte de la réponse de
+      // @polymarket/clob-client n'est pas garantie identique entre versions.
+      orderIdYes = rYes.value?.orderID ?? rYes.value?.orderId ?? rYes.value?.id ?? null;
+      orderIdNo  = rNo.value?.orderID  ?? rNo.value?.orderId  ?? rNo.value?.id  ?? null;
       botLog("EXEC", "Ordres live remplis (2 jambes) ✅");
     } else if (yesOk || noOk) {
       // [FIX 3] REMPLISSAGE PARTIEL — une jambe a rempli, l'autre non. On est exposé
@@ -563,6 +734,39 @@ async function executeOrder(marketId) {
     }
   }
 
+  // [v15-10] Simulation réaliste de l'exécution PAPER — UNIQUEMENT si aucun client CLOB
+  // n'est configuré (mode encore "PAPER" à ce stade). Le bloc if(client) ci-dessus, qui
+  // gère intégralement le mode LIVE, n'est ni touché ni traversé quand client existe
+  // (il aurait déjà fait `return` en cas de problème) : son comportement reste
+  // strictement identique à avant, conformément à la consigne.
+  if (!client) {
+    const sim = engine.simulatePaperExecution(arbUsed, c);
+    if (sim.delayMs > 0) await new Promise(r => setTimeout(r, sim.delayMs)); // latence réseau simulée
+    if (sim.outcome === 'failed') {
+      registerExecutionError();
+      botLog("WARN", `[PAPER] Échec d'exécution simulé sur ${m.title.slice(0,40)} (latence ${sim.delayMs}ms) → annulé`);
+      return;
+    }
+    if (sim.outcome === 'rejected') {
+      botLog("WARN", `[PAPER] Ordre rejeté (simulé) sur ${m.title.slice(0,40)} (latence ${sim.delayMs}ms) → annulé`);
+      return;
+    }
+    // 'filled' ou 'partial' : on ajuste arbUsed (prix effectif dégradé + fraction
+    // réellement remplie) — le code de création de position ci-dessous, commun à LIVE
+    // et PAPER, n'a besoin d'aucune modification supplémentaire pour en tenir compte.
+    const feeCost = (c.feeBps ?? 0) / 10000;
+    arbUsed = {
+      ...arbUsed,
+      cost: sim.effectiveCost,
+      edge: 1 - sim.effectiveCost - feeCost,
+      realCostUSDC: (arbUsed.realCostUSDC ?? targetSize) * sim.filledFraction,
+      roundedShares: (arbUsed.roundedShares ?? (targetSize/arbUsed.cost)) * sim.filledFraction,
+    };
+    if (sim.outcome === 'partial') {
+      botLog("WARN", `[PAPER] Remplissage partiel simulé (${(sim.filledFraction*100).toFixed(0)}%) sur ${m.title.slice(0,40)} (latence ${sim.delayMs}ms)`);
+    }
+  }
+
   // [FIX] Le coût réel engagé (realCostUSDC) peut différer légèrement de targetSize à
   // cause de l'arrondi à 2 décimales des parts — on enregistre le coût RÉEL, pas la
   // taille visée initialement, pour un suivi de bankroll exact.
@@ -572,6 +776,9 @@ async function executeOrder(marketId) {
 
   const pos = {
     id: `${marketId}-${now}`, marketId, label: m.title, slug: m.slug,
+    category: m.category, // [v15-9] nécessaire pour le rendement par catégorie de marché
+    tokenYes: m.tokenYes, tokenNo: m.tokenNo, // [v15-2] nécessaires pour interroger le CLOB plus tard
+    orderIdYes, orderIdNo,                     // [v15-2/4] idem
     cost: arbUsed.cost, edge: arbUsed.edge, size: realCost, shares,
     expectedProfit, // [v12-6/8] pour comparaison profit attendu vs profit réel
     ts: new Date().toISOString(), status: "OPEN", mode, pnlUSDC: 0,
@@ -659,6 +866,53 @@ function computeNextCheckTick(prevArb, newMarket, cfg, tickCount) {
   return changed ? tickCount : tickCount + (cfg.lowActivitySkipTicks ?? 1);
 }
 
+// ─── [v15-2/4] VALIDATION DES POSITIONS LIVE (périodique + réconciliation au démarrage) ──
+// PROBLÈME RÉSOLU : une position ouverte en mode LIVE attendait jusqu'ici uniquement la
+// résolution du marché, sans jamais revérifier que les ordres CLOB sous-jacents existent
+// encore réellement (un ordre peut être annulé côté plateforme, expirer, ou l'état
+// interne peut diverger de l'état réel pour toute autre raison).
+// RISQUES ÉVITÉS : détecter ce genre d'incohérence tôt permet une intervention humaine
+// avant qu'elle ne s'aggrave — mais JAMAIS d'action automatique (annulation, fermeture) :
+// uniquement une détection et une journalisation, exactement comme demandé.
+// CHOIX TECHNIQUE : une seule fonction, appelée à la fois périodiquement (toutes les
+// positionValidationEveryNTicks cycles) ET une fois juste après le chargement de l'état
+// au démarrage (réconciliation v15-4) — évite toute duplication entre les deux besoins,
+// qui sont fonctionnellement identiques ("l'état interne correspond-il au réel ?").
+async function validateOpenLivePositions() {
+  const client = await getClobClient();
+  const openLive = bot.positions.filter(p => p.status === "OPEN" && p.mode === "LIVE");
+  if (openLive.length === 0) return;
+  if (!client) {
+    // Cas typique juste après un redémarrage sans POLY_PRIVATE_KEY reconfigurée, ou si
+    // la clé a été retirée entre-temps — on le signale clairement plutôt que d'échouer
+    // silencieusement.
+    botLog("RISK", `⚠ ${openLive.length} position(s) LIVE ouverte(s) mais aucun client CLOB disponible — impossible de vérifier leur état réel sur Polymarket`);
+    return;
+  }
+  for (const p of openLive) {
+    for (const [leg, orderId] of [["YES", p.orderIdYes], ["NO", p.orderIdNo]]) {
+      if (!orderId) {
+        botLog("RISK", `⚠ Position ${p.id} (${leg}) : aucun ID d'ordre enregistré (position antérieure à ce correctif ?), impossible à valider`);
+        continue;
+      }
+      try {
+        // [v15-2] Nom de méthode standard de @polymarket/clob-client pour interroger un
+        // ordre par son ID — enveloppé dans son propre try/catch : une méthode absente
+        // ou une erreur réseau ne doit jamais interrompre la vérification des autres
+        // positions ni, a fortiori, le moteur de trading.
+        const order = await client.getOrder(orderId);
+        const status = (order?.status ?? "").toString().toUpperCase();
+        if (!order || status === "CANCELED" || status === "CANCELLED" || status === "EXPIRED") {
+          botLog("RISK", `⚠ INCOHÉRENCE : position ${p.id} (${leg}) suivie ouverte en interne, mais l'ordre ${orderId} est ${order ? status : "INTROUVABLE"} côté Polymarket — vérification manuelle recommandée, aucune fermeture automatique effectuée`);
+          triggerAlert('position_incoherence', { positionId:p.id, leg, orderId, status: order ? status : "NOT_FOUND" }).catch(()=>{});
+        }
+      } catch(e) {
+        botLog("WARN", `Validation position ${p.id} (${leg}, ordre ${orderId}) impossible : ${e.message}`);
+      }
+    }
+  }
+}
+
 async function tick() {
   // [FIX] Garde anti-chevauchement — sans elle, si un cycle prend plus de temps que
   // refreshMs (réseau lent, 60 marchés à vérifier), le cycle suivant pourrait démarrer
@@ -684,6 +938,12 @@ async function tick() {
   // sur 4, soit environ toutes les minutes) — le carnet d'ordres, lui, reste vérifié à
   // chaque cycle car c'est lui qui détermine si un arbitrage est tradable maintenant.
   const shouldCheckClosed = (bot.tickCount % Math.max(c.closedCheckEveryNTicks ?? 1, 1)) === 0;
+  // [v15-2] Validation périodique des positions live — volontairement en fire-and-forget
+  // (pas de `await`) : c'est une vérification de diagnostic, elle ne doit jamais ralentir
+  // ni bloquer le cycle principal de scan/trading, même si l'appel CLOB est lent.
+  if ((bot.tickCount % Math.max(c.positionValidationEveryNTicks ?? 20, 1)) === 0) {
+    validateOpenLivePositions().catch(e => console.error('[POS-VALIDATE]', e.message));
+  }
 
   const batchSize = 4, delayMs = 200;
   for (let i=0; i<bot.markets.length; i += batchSize) {
@@ -754,15 +1014,92 @@ async function tick() {
   await persistBotState();
   } finally {
     bot.ticking = false;
+    // [v15-3] Marqué APRÈS le persistBotState ci-dessus, à la toute fin du cycle — c'est
+    // précisément ce que le watchdog surveille : "le moteur a-t-il terminé un cycle
+    // complet récemment ?", pas juste "a-t-il commencé à en exécuter un".
+    bot.lastTickCompletedAt = Date.now();
   }
 }
 
-let tickTimer = null, discTimer = null;
+// [v15-6] Nettoyage automatique — limite la croissance de la table `logs` en supprimant
+// les entrées plus vieilles que cfg.logRetentionDays. Appelé au démarrage puis toutes
+// les 6h (une tâche de maintenance, pas besoin d'une cadence plus fine).
+// [v15-9] Snapshot idempotent du bankroll du jour — appelé au démarrage puis toutes les
+// heures ; ON CONFLICT DO UPDATE garantit qu'on garde toujours la valeur la PLUS RÉCENTE
+// de la journée en cours (pas la première), sans jamais créer de doublon par date.
+async function snapshotBankroll() {
+  try {
+    const today = new Date().toISOString().slice(0,10);
+    await pool.query(
+      `INSERT INTO daily_snapshots (date, bankroll) VALUES ($1,$2)
+       ON CONFLICT (date) DO UPDATE SET bankroll=$2, created_at=now()`,
+      [today, bot.bankroll]
+    );
+  } catch(e) {
+    console.error('[DB] Erreur snapshot bankroll:', e.message);
+  }
+}
+
+async function cleanupOldLogs() {
+  try {
+    const days = bot.cfg.logRetentionDays ?? 14;
+    const r = await pool.query(`DELETE FROM logs WHERE created_at < now() - interval '${days} days'`);
+    if (r.rowCount > 0) console.log(`[DB] Nettoyage logs : ${r.rowCount} entrées de plus de ${days}j supprimées`);
+  } catch(e) {
+    console.error('[DB] Erreur nettoyage logs:', e.message);
+  }
+}
+
+let tickTimer = null, discTimer = null, watchdogTimer = null, logCleanupTimer = null;
+
+// ─── [v15-3] WATCHDOG DU MOTEUR PRINCIPAL ──────────────────────────────────
+// PROBLÈME RÉSOLU : si tick() reste bloqué indéfiniment (ex. une promesse qui ne se
+// résout jamais dans un cas limite non prévu) ou si setInterval s'arrête pour une
+// raison quelconque, rien ne le détectait — le bot semblait "actif" (process vivant,
+// serveur qui répond) tout en ayant complètement cessé de scanner/trader.
+// RISQUES ÉVITÉS : sans watchdog, ce genre de blocage silencieux pourrait passer
+// inaperçu pendant des heures avant qu'un humain ne remarque l'absence de nouveaux logs.
+// CHOIX TECHNIQUE : totalement indépendant de la logique d'arbitrage — ce timer ne
+// touche jamais bot.markets/positions/bankroll, il ne fait que lire lastTickCompletedAt
+// et, en cas de silence prolongé, recréer le SEUL setInterval de tick() (un "redémarrage
+// contrôlé" du minuteur, pas un redémarrage du process — plus sûr, n'interrompt jamais
+// une connexion DB ou un état en mémoire déjà valide).
+function startWatchdog() {
+  watchdogTimer = setInterval(() => {
+    const silenceMs = Date.now() - (bot.lastTickCompletedAt ?? bot.startedAt ?? Date.now());
+    const maxSilence = bot.cfg.watchdogMaxSilenceMs ?? 120000;
+    if (silenceMs > maxSilence) {
+      botLog("RISK", `⛔ WATCHDOG : aucun cycle terminé depuis ${Math.round(silenceMs/1000)}s (seuil ${Math.round(maxSilence/1000)}s) — redémarrage contrôlé du minuteur`);
+      triggerAlert('watchdog_restart', { silenceMs, maxSilence }).catch(()=>{});
+      // Redémarrage contrôlé : on ne touche qu'au minuteur, jamais à bot.ticking (au cas
+      // où un cycle serait réellement encore en cours de traitement légitime) — si
+      // bot.ticking était bloqué à true par un vrai blocage, on le libère explicitement
+      // ici pour permettre au prochain tick() de repartir plutôt que de rester bloqué
+      // indéfiniment par la garde anti-chevauchement (v11).
+      bot.ticking = false;
+      clearInterval(tickTimer);
+      tickTimer = setInterval(() => { tick().catch(e=>console.error('[TICK]',e.message)); }, Math.max(bot.cfg.refreshMs || 15000, 15000));
+      tick().catch(e=>console.error('[TICK]',e.message)); // relance immédiate, sans attendre le prochain intervalle
+    }
+  }, 30000); // vérification toutes les 30s — largement plus fréquent que le seuil d'alerte
+}
+
 async function startEngine() {
   await loadBotState();
+  // [v15-4] Réconciliation au redémarrage : si des positions LIVE existaient déjà avant
+  // ce redémarrage (déploiement, crash, veille Render), on vérifie une fois leur état
+  // réel sur Polymarket avant de reprendre le scan normal — réutilise exactement la même
+  // logique que la validation périodique (v15-2), aucune duplication. Détection seule,
+  // jamais de création/modification/annulation automatique d'ordre.
+  await validateOpenLivePositions().catch(e => console.error('[RECONCILE]', e.message));
   await discover();
   tickTimer = setInterval(() => { tick().catch(e=>console.error('[TICK]',e.message)); }, Math.max(bot.cfg.refreshMs || 15000, 15000));
   discTimer = setInterval(() => { discover().catch(e=>console.error('[DISC]',e.message)); }, 300000);
+  startWatchdog(); // [v15-3]
+  cleanupOldLogs().catch(()=>{});
+  logCleanupTimer = setInterval(() => { cleanupOldLogs().catch(()=>{}); }, 6*60*60*1000); // [v15-6] toutes les 6h
+  snapshotBankroll().catch(()=>{});
+  setInterval(() => { snapshotBankroll().catch(()=>{}); }, 60*60*1000); // [v15-9] toutes les heures
   botLog("SYS", "Moteur autonome v11 démarré — arbitrage mécanique, sans corrélation");
 
   // [FIX] Sans trafic entrant, Render (plan gratuit) met le service en veille après 15 min
@@ -787,6 +1124,44 @@ function serializeMarket(m) {
   const { bookYes, bookNo, ...rest } = m;
   return rest;
 }
+// [v15-6] Consultation de l'historique persistant des logs — au-delà des 400 entrées
+// gardées en mémoire (bot.logs, toujours utilisées telles quelles par /bot-state).
+// Pagination simple (limit/offset) + filtre optionnel par type d'événement.
+// [v15-9] Tableau de bord historique — évolution du bankroll (table dédiée, survit aux
+// redémarrages) + répartition par jour/semaine/mois/catégorie (calculée à la demande
+// depuis les positions en mémoire, jamais recalculée en continu).
+app.get('/bot-history-stats', async (req, res) => {
+  try {
+    const r = await pool.query('SELECT date, bankroll FROM daily_snapshots ORDER BY date ASC LIMIT 366');
+    res.json({
+      bankrollEvolution: r.rows,
+      breakdown: engine.computeHistoricalBreakdown(bot.positions),
+      advancedStats: engine.computeAdvancedStats(bot.positions), // [v15-5] au passage, même esprit reporting
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message, bankrollEvolution: [], breakdown: {} });
+  }
+});
+
+app.get('/bot-logs-history', async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 100, 1000);
+  const offset = parseInt(req.query.offset) || 0;
+  const kind = req.query.kind;
+  try {
+    const params = kind ? [kind, limit, offset] : [limit, offset];
+    const where = kind ? 'WHERE kind = $1' : '';
+    const limitIdx = kind ? '$2' : '$1', offsetIdx = kind ? '$3' : '$2';
+    const r = await pool.query(
+      `SELECT id, kind, msg, created_at FROM logs ${where} ORDER BY created_at DESC LIMIT ${limitIdx} OFFSET ${offsetIdx}`,
+      params
+    );
+    dbHealth.connected = true; dbHealth.lastSuccessfulReadAt = new Date().toISOString();
+    res.json({ logs: r.rows, limit, offset });
+  } catch(e) {
+    res.status(500).json({ error: e.message, logs: [] });
+  }
+});
+
 app.get('/bot-state', (req, res) => {
   const cl = bot.positions.filter(p=>p.status==="CLOSED");
   const pnl = cl.reduce((s,p)=>s+(p.pnlUSDC??0),0);
@@ -812,6 +1187,10 @@ app.get('/bot-state', (req, res) => {
     consecutiveErrors: bot.consecutiveErrors,
     rejected: bot.rejected.slice(-50), // [v12-8] dernières opportunités refusées
     rejectedStats: engine.computeRejectedStats(bot.rejected), // [v14-2] agrégation exploitable, purement passive
+    circuitBreakers, // [v15-1] état du circuit breaker par API (lecture seule)
+    dbHealth,        // [v15-7] santé de la connexion PostgreSQL
+    alerts: bot.alerts.slice(-30), // [v15-8] dernières alertes déclenchées
+    advancedStats: engine.computeAdvancedStats(bot.positions), // [v15-5] Profit Factor, Max Drawdown, etc.
   });
 });
 
@@ -965,4 +1344,10 @@ module.exports = {
   recordRejected, registerExecutionError, checkRiskLimits, currentExposure,
   shouldSkipBookFetch, computeNextCheckTick,          // [v14-4]
   computeApiHealth, classifyApi, apiMetrics,           // [v14-3]
+  circuitBreakers, isCircuitOpen, recordCircuitResult, // [v15-1]
+  validateOpenLivePositions,                           // [v15-2/4]
+  startWatchdog,                                       // [v15-3]
+  dbHealth,                                            // [v15-7]
+  registerAlertChannel, triggerAlert,                  // [v15-8]
+  snapshotBankroll, cleanupOldLogs,                    // [v15-6/9]
 };
