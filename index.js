@@ -135,10 +135,20 @@ async function triggerAlert(type, details) {
 }
 if (process.env.ALERT_WEBHOOK_URL) {
   registerAlertChannel(async (alert) => {
-    await fetch(process.env.ALERT_WEBHOOK_URL, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: `🔔 POLYARB [${alert.type}] ${JSON.stringify(alert.details)}` }),
-    });
+    // [FIX] Timeout explicite — sans lui, un webhook lent ou muet bloquerait
+    // indéfiniment ce canal (et donc triggerAlert, qui l'attend), pouvant accumuler
+    // des promesses jamais résolues si plusieurs alertes se déclenchent en rafale.
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 5000);
+    try {
+      await fetch(process.env.ALERT_WEBHOOK_URL, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: `🔔 POLYARB [${alert.type}] ${JSON.stringify(alert.details)}` }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(t);
+    }
   });
 }
 
@@ -304,6 +314,7 @@ const bot = {
   alerts: [],                            // [v15-8] historique des alertes déclenchées (borné à 100)
   startedAt: Date.now(),                 // [v15-3] pour le watchdog avant le tout premier tick
   lastTickCompletedAt: null,             // [v15-3] mis à jour à la fin de chaque cycle réussi
+  flaggedPositionLegs: new Set(),        // [v15-2 FIX] évite de re-signaler la même incohérence en boucle
   eventCounters: {},                     // [v14-5] compteur par type d'événement (kind) depuis le démarrage
   lastSummaryAt: Date.now(),             // [v14-5] pour espacer les résumés périodiques
 };
@@ -743,7 +754,11 @@ async function executeOrder(marketId) {
     const sim = engine.simulatePaperExecution(arbUsed, c);
     if (sim.delayMs > 0) await new Promise(r => setTimeout(r, sim.delayMs)); // latence réseau simulée
     if (sim.outcome === 'failed') {
-      registerExecutionError();
+      // [FIX] Ne PAS appeler registerExecutionError() ici — c'est un échec SIMULÉ à des
+      // fins de réalisme du mode paper, pas un vrai problème d'exécution. Le confondre
+      // avec de vrais échecs LIVE (même compteur, même kill-switch) pourrait mettre le
+      // bot en pause pour une simple malchance statistique simulée, en faisant croire à
+      // tort qu'un problème opérationnel réel est survenu.
       botLog("WARN", `[PAPER] Échec d'exécution simulé sur ${m.title.slice(0,40)} (latence ${sim.delayMs}ms) → annulé`);
       return;
     }
@@ -891,8 +906,15 @@ async function validateOpenLivePositions() {
   }
   for (const p of openLive) {
     for (const [leg, orderId] of [["YES", p.orderIdYes], ["NO", p.orderIdNo]]) {
+      // [FIX] Une même incohérence non résolue serait re-signalée à CHAQUE cycle de
+      // validation (~toutes les 5 min) tant que la position reste ouverte — ça spamme le
+      // journal et, surtout, réenverrait une alerte externe (webhook) en boucle pour le
+      // même incident jamais résolu. On ne signale qu'une seule fois par (position, jambe).
+      const flagKey = `${p.id}:${leg}`;
+      if (bot.flaggedPositionLegs.has(flagKey)) continue;
       if (!orderId) {
         botLog("RISK", `⚠ Position ${p.id} (${leg}) : aucun ID d'ordre enregistré (position antérieure à ce correctif ?), impossible à valider`);
+        bot.flaggedPositionLegs.add(flagKey);
         continue;
       }
       try {
@@ -905,8 +927,12 @@ async function validateOpenLivePositions() {
         if (!order || status === "CANCELED" || status === "CANCELLED" || status === "EXPIRED") {
           botLog("RISK", `⚠ INCOHÉRENCE : position ${p.id} (${leg}) suivie ouverte en interne, mais l'ordre ${orderId} est ${order ? status : "INTROUVABLE"} côté Polymarket — vérification manuelle recommandée, aucune fermeture automatique effectuée`);
           triggerAlert('position_incoherence', { positionId:p.id, leg, orderId, status: order ? status : "NOT_FOUND" }).catch(()=>{});
+          bot.flaggedPositionLegs.add(flagKey);
         }
       } catch(e) {
+        // [FIX] Une erreur de vérification (réseau, méthode indisponible) N'EST PAS une
+        // incohérence confirmée — on ne marque PAS flagKey ici, pour retenter la
+        // prochaine fois plutôt que d'abandonner silencieusement cette jambe pour toujours.
         botLog("WARN", `Validation position ${p.id} (${leg}, ordre ${orderId}) impossible : ${e.message}`);
       }
     }
